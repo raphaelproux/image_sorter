@@ -523,6 +523,13 @@ fn exif_category(tag: exif::Tag) -> &'static str {
 }
 
 fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<String>) {
+    let style = ui.style_mut();
+    for font_id in style.text_styles.values_mut() {
+        font_id.size *= 0.9;
+    }
+    style.spacing.item_spacing.y = 0.0;
+    style.spacing.item_spacing.x = 3.0;
+    let line_height = style.text_styles[&egui::TextStyle::Body].size * 1.25;
     if photo.exif.is_empty() {
         ui.label("No EXIF data");
         return;
@@ -539,11 +546,12 @@ fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<Str
                 if fields.is_empty() {
                     continue;
                 }
-                ui.add_space(6.0);
+                ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new(category)
                         .strong()
-                        .size(15.0)
+                        .size(14.0)
+                        .line_height(Some(line_height * 0.9))
                         .color(ui.visuals().strong_text_color()),
                 );
                 ui.separator();
@@ -551,20 +559,39 @@ fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<Str
                     let key = format!("{}:{:?}", photo.display.display(), tag);
                     let is_expanded = expanded.contains(&key);
                     let long = value.chars().count() > 50;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(name);
-                        if long && !is_expanded {
-                            let shortened: String = value.chars().take(50).collect();
-                            ui.label(format!("{shortened}…"));
-                            if ui.small_button("Expand").clicked() {
+                    let display_value = if long && !is_expanded {
+                        format!("{}…", value.chars().take(50).collect::<String>())
+                    } else {
+                        value.clone()
+                    };
+                    ui.scope(|ui| {
+                        ui.spacing_mut().interact_size.y = line_height + 4.0;
+                        ui.horizontal_wrapped(|ui| {
+                            let mut row = egui::text::LayoutJob::default();
+                            egui::RichText::new(name)
+                                .strong()
+                                .line_height(Some(line_height))
+                                .append_to(
+                                    &mut row,
+                                    ui.style(),
+                                    egui::FontSelection::Default,
+                                    egui::Align::BOTTOM,
+                                );
+                            egui::RichText::new(format!(" {display_value}"))
+                                .line_height(Some(line_height))
+                                .append_to(
+                                    &mut row,
+                                    ui.style(),
+                                    egui::FontSelection::Default,
+                                    egui::Align::BOTTOM,
+                                );
+                            ui.label(row);
+                            if long && !is_expanded && ui.small_button("Expand").clicked() {
                                 expanded.insert(key.clone());
-                            }
-                        } else {
-                            ui.label(value);
-                            if long && ui.small_button("Collapse").clicked() {
+                            } else if long && is_expanded && ui.small_button("Collapse").clicked() {
                                 expanded.remove(&key);
                             }
-                        }
+                        });
                     });
                 }
             }
@@ -2060,7 +2087,9 @@ impl eframe::App for SorterApp {
             self.open_settings();
         }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
+                ui.add_space(8.0);
                 if ui.button("Open folder").clicked() {
                     self.choose_folder(ctx);
                 }
@@ -2119,6 +2148,7 @@ impl eframe::App for SorterApp {
                     }
                 });
             });
+            ui.add_space(4.0);
         });
         if self.mode == ViewMode::Grid {
             egui::TopBottomPanel::bottom("grid_actions").show(ctx, |ui| {
@@ -2321,26 +2351,29 @@ impl eframe::App for SorterApp {
                     return;
                 }
                 let photo = self.photos[self.current].clone();
-                egui::TopBottomPanel::top("viewer_info").show_inside(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if self.settings.show_filenames {
-                            ui.label(
-                                photo
-                                    .display
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy(),
-                            );
-                        }
-                        if self.settings.show_datetime {
-                            ui.label(photo.datetime.as_deref().unwrap_or("No EXIF datetime"));
-                        }
-                        if photo.kept {
-                            ui.label("Kept")
-                                .on_hover_text("This photo has been copied to the keep folder.");
-                        }
+                if self.settings.show_filenames || self.settings.show_datetime {
+                    egui::TopBottomPanel::top("viewer_info").show_inside(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if self.settings.show_filenames {
+                                ui.label(
+                                    photo
+                                        .display
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy(),
+                                );
+                            }
+                            if self.settings.show_datetime {
+                                ui.label(photo.datetime.as_deref().unwrap_or("No EXIF datetime"));
+                            }
+                            if photo.kept {
+                                ui.label("Kept").on_hover_text(
+                                    "This photo has been copied to the keep folder.",
+                                );
+                            }
+                        });
                     });
-                });
+                }
                 if self.last_viewer_image.as_ref() != Some(&photo.display) {
                     self.prioritize_viewer_image(&photo.display);
                     self.last_viewer_image = Some(photo.display.clone());
@@ -2352,6 +2385,7 @@ impl eframe::App for SorterApp {
                     }
                 }
                 egui::TopBottomPanel::bottom("viewer_actions").show_inside(ui, |ui| {
+                    ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Previous").clicked() {
                             self.previous_photo();
@@ -2384,9 +2418,9 @@ impl eframe::App for SorterApp {
                         }
                     });
                 });
-                egui::SidePanel::right("viewer_exif")
+                egui::SidePanel::right("exif_panel")
                     .resizable(true)
-                    .default_width(260.0)
+                    .default_width(340.0)
                     .show_animated_inside(ui, self.settings.show_exif, |ui| {
                         ui.heading("EXIF");
                         show_exif_fields(ui, &photo, &mut self.expanded_exif);
@@ -2506,9 +2540,9 @@ impl eframe::App for SorterApp {
                 let (grid_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
                 ui.scope_builder(egui::UiBuilder::new().max_rect(grid_rect), |ui| {
                     if self.settings.show_exif {
-                        egui::SidePanel::right("grid_exif")
+                        egui::SidePanel::right("exif_panel")
                             .resizable(true)
-                            .default_width(280.0)
+                            .default_width(340.0)
                             .show_inside(ui, |ui| {
                                 ui.heading("Selected image EXIF");
                                 let selected = if self.selection.len() == 1 {
@@ -2584,6 +2618,23 @@ impl eframe::App for SorterApp {
                                         / columns as f32)
                                         .max(100.0);
                                     let stop = (index + columns).min(self.photos.len());
+                                    // Every thumbnail's long edge equals the cell width; the row
+                                    // height follows the tallest resulting thumbnail.
+                                    let row_end = (index..stop)
+                                        .find(|&i| self.photos[i].subfolder != folder)
+                                        .unwrap_or(stop);
+                                    let thumb_height = (index..row_end)
+                                        .map(|i| {
+                                            let path = self.photos[i].display.clone();
+                                            self.viewer_texture(&path, (320, 240))
+                                                .map(|texture| {
+                                                    let size = texture.size_vec2();
+                                                    cell_width * size.y / size.x.max(size.y).max(1.0)
+                                                })
+                                                .unwrap_or(cell_width * 0.75)
+                                        })
+                                        .fold(0.0_f32, f32::max)
+                                        .max(cell_width * 0.25);
                                     while index < stop {
                                         if self.photos[index].subfolder != folder {
                                             break;
@@ -2619,7 +2670,7 @@ impl eframe::App for SorterApp {
                                                     .size(10.0),
                                                 );
                                             }
-                                            let size = Vec2::splat(cell_width);
+                                            let size = Vec2::new(cell_width, thumb_height);
                                             let (rect, response) =
                                                 ui.allocate_exact_size(size, egui::Sense::click());
                                             let visible = ui.is_rect_visible(rect);
@@ -2705,28 +2756,42 @@ impl eframe::App for SorterApp {
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions::default();
+    let icon = image::load_from_memory(include_bytes!("../icon/icon.png"))
+        .expect("failed to load embedded app icon")
+        .to_rgba8();
+    let (width, height) = icon.dimensions();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("image_sorter")
+            .with_inner_size(egui::vec2(1440.0, 900.0))
+            .with_icon(egui::IconData {
+                rgba: icon.into_raw(),
+                width,
+                height,
+            }),
+        ..Default::default()
+    };
     eframe::run_native(
         "Image Sorter",
         options,
         Box::new(|creation_context| {
             let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
-                "Roboto".into(),
-                egui::FontData::from_static(include_bytes!("../assets/fonts/Roboto.ttf")).into(),
+                "Figtree".into(),
+                egui::FontData::from_static(include_bytes!("../assets/fonts/Figtree.ttf")).into(),
             );
             fonts
                 .families
                 .get_mut(&egui::FontFamily::Proportional)
                 .unwrap()
-                .insert(0, "Roboto".into());
+                .insert(0, "Figtree".into());
             creation_context.egui_ctx.set_fonts(fonts);
             let mut style = (*creation_context.egui_ctx.style()).clone();
             for font_id in style.text_styles.values_mut() {
                 font_id.size *= 1.08;
             }
-            style.spacing.button_padding = egui::vec2(11.0, 7.0);
-            style.spacing.interact_size = egui::vec2(40.0, 30.0);
+            style.spacing.button_padding = egui::vec2(11.0, 4.0);
+            style.spacing.interact_size = egui::vec2(40.0, 24.0);
             creation_context.egui_ctx.set_style(style);
             Ok(Box::<SorterApp>::default())
         }),

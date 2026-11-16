@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Image Sorter
+Exec=image_sorter
+Icon=image_sorter
+StartupWMClass=image_sorter
+Terminal=false
+Categories=Graphics;Photography;
