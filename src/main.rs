@@ -1858,6 +1858,30 @@ impl SorterApp {
         }
     }
 
+    fn retain_visible_thumbnails(&mut self, visible: &HashSet<PathBuf>) {
+        let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
+            let mut removed = Vec::new();
+            let mut retained = Vec::new();
+            for job in std::mem::take(&mut queue.jobs) {
+                let is_grid_thumbnail =
+                    job.size == VIEW_PREVIEW && job.priority < PREFETCH_MIN_PRIORITY;
+                if is_grid_thumbnail && !visible.contains(&job.key.path) {
+                    queue.active.remove(&job.key);
+                    removed.push(job.key);
+                } else {
+                    retained.push(job);
+                }
+            }
+            queue.jobs = retained;
+            removed
+        } else {
+            Vec::new()
+        };
+        for key in removed {
+            self.queued_textures.remove(&key);
+        }
+    }
+
     fn prioritize_viewer_image(&mut self, path: &Path) {
         let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
             let mut removed = Vec::new();
@@ -2865,6 +2889,7 @@ impl eframe::App for SorterApp {
                 let mut index = 0;
                 let mut previous_folder: Option<PathBuf> = None;
                 let mut pending_selection = None;
+                let mut visible_thumbnails: HashSet<PathBuf> = HashSet::new();
                 let root_name = self
                     .root
                     .as_ref()
@@ -3022,6 +3047,7 @@ impl eframe::App for SorterApp {
                                                 ui.allocate_exact_size(size, egui::Sense::click());
                                             let visible = ui.is_rect_visible(rect);
                                             if visible {
+                                                visible_thumbnails.insert(photo.display.clone());
                                                 self.texture(ctx, &photo.display, (320, 240), 0);
                                             }
                                             if let Some(texture) =
@@ -3093,6 +3119,7 @@ impl eframe::App for SorterApp {
                         });
                 });
                 self.scroll_to_selection = false;
+                self.retain_visible_thumbnails(&visible_thumbnails);
                 if let Some((index, modifiers)) = pending_selection {
                     self.select(index, modifiers);
                 }
