@@ -217,6 +217,7 @@ struct SorterApp {
     last_viewer_image: Option<PathBuf>,
     scroll_to_selection: bool,
     grid_columns: usize,
+    column_goal: Option<usize>,
     source_sizes: HashMap<PathBuf, (u32, u32)>,
     texture_fingerprints: HashMap<PathBuf, u64>,
     expanded_exif: HashSet<String>,
@@ -305,6 +306,7 @@ impl Default for SorterApp {
             last_viewer_image: None,
             scroll_to_selection: false,
             grid_columns: 1,
+            column_goal: None,
             source_sizes: HashMap::new(),
             texture_fingerprints: HashMap::new(),
             expanded_exif: HashSet::new(),
@@ -1691,6 +1693,7 @@ impl SorterApp {
             self.root = Some(folder.clone());
             self.photos.clear();
             self.selection.clear();
+            self.anchor = None;
             self.source_sizes.clear();
             self.texture_fingerprints.clear();
             self.pending_source_info.clear();
@@ -1757,6 +1760,7 @@ impl SorterApp {
                 self.texture_last_used.clear();
                 self.queued_textures.clear();
                 self.selection.clear();
+                self.anchor = None;
                 self.current = 0;
             }
         } else if self.root.is_some() && self.notice.starts_with("Scanning ") {
@@ -2135,6 +2139,7 @@ impl SorterApp {
                                 })
                             });
                             self.selection.clear();
+                            self.anchor = None;
                             if let Some(index) = self
                                 .photos
                                 .iter()
@@ -2211,6 +2216,7 @@ impl SorterApp {
                                 .retain(|photo| !successful_photos.contains(&photo.display));
                         }
                         self.selection.clear();
+                        self.anchor = None;
                         let available: HashSet<_> = self
                             .photos
                             .iter()
@@ -2325,6 +2331,8 @@ impl SorterApp {
         if self.mode == ViewMode::Viewer && self.current < self.photos.len() {
             self.selection.clear();
             self.selection.insert(self.current);
+            self.anchor = Some(self.current);
+            self.column_goal = None;
             self.scroll_to_selection = true;
         }
         self.mode = ViewMode::Grid;
@@ -2350,14 +2358,71 @@ impl SorterApp {
         self.pan = Vec2::ZERO;
     }
 
+    /// First and last (exclusive) photo index of the folder section containing `index`.
+    fn folder_bounds(&self, index: usize) -> (usize, usize) {
+        let folder = &self.photos[index].subfolder;
+        let mut start = index;
+        while start > 0 && self.photos[start - 1].subfolder == *folder {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < self.photos.len() && self.photos[end].subfolder == *folder {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// Moves the grid cursor the way the grid is drawn: every folder section starts
+    /// a new row at column 0. Vertical moves keep the column (remembered across short
+    /// rows and across folders). Returns the new index and the column to remember.
+    fn grid_move(&self, index: usize, dx: isize, dy: isize) -> (usize, Option<usize>) {
+        let columns = self.grid_columns.max(1);
+        let (start, end) = self.folder_bounds(index);
+        if dy == 0 {
+            let target = (index as isize + dx).clamp(0, self.photos.len() as isize - 1);
+            return (target as usize, None);
+        }
+        let column = self.column_goal.unwrap_or((index - start) % columns);
+        let row = (index - start) / columns;
+        let in_row = |section_start: usize, section_end: usize, row: usize| {
+            (section_start + row * columns + column).min(section_end - 1)
+        };
+        let target = if dy < 0 {
+            if row > 0 {
+                in_row(start, end, row - 1)
+            } else if start > 0 {
+                let (previous_start, previous_end) = self.folder_bounds(start - 1);
+                let last_row = (previous_end - previous_start - 1) / columns;
+                in_row(previous_start, previous_end, last_row)
+            } else {
+                index
+            }
+        } else if start + (row + 1) * columns < end {
+            in_row(start, end, row + 1)
+        } else if end < self.photos.len() {
+            let (next_start, next_end) = self.folder_bounds(end);
+            in_row(next_start, next_end, 0)
+        } else {
+            index
+        };
+        (target, Some(column))
+    }
+
+    fn grid_cursor(&self) -> Option<usize> {
+        if self.photos.is_empty() {
+            return None;
+        }
+        self.anchor
+            .or_else(|| self.selection.iter().min().copied())
+            .or(Some(self.current))
+            .map(|index| index.min(self.photos.len() - 1))
+    }
+
     fn leave_photo(&mut self) {
         if self.mode == ViewMode::Viewer {
             self.next_photo();
         } else if !self.photos.is_empty() {
-            let current = self
-                .anchor
-                .or_else(|| self.selection.iter().next().copied())
-                .unwrap_or(0);
+            let current = self.grid_cursor().unwrap_or(0);
             let next = (current + 1) % self.photos.len();
             self.select(next, Modifiers::default());
             self.current = next;
@@ -2366,6 +2431,7 @@ impl SorterApp {
     }
 
     fn select(&mut self, index: usize, modifiers: Modifiers) {
+        self.column_goal = None;
         if modifiers.shift {
             if let Some(anchor) = self.anchor {
                 self.selection.clear();
@@ -2510,13 +2576,13 @@ impl eframe::App for SorterApp {
                     })
                     .collect::<Vec<_>>();
                 let direction = if input.key_pressed(Key::ArrowLeft) {
-                    Some(-1isize)
+                    Some((-1isize, 0isize))
                 } else if input.key_pressed(Key::ArrowRight) {
-                    Some(1)
+                    Some((1, 0))
                 } else if input.key_pressed(Key::ArrowUp) {
-                    Some(-(self.grid_columns as isize))
+                    Some((0, -1))
                 } else if input.key_pressed(Key::ArrowDown) {
-                    Some(self.grid_columns as isize)
+                    Some((0, 1))
                 } else {
                     None
                 };
@@ -2548,26 +2614,16 @@ impl eframe::App for SorterApp {
                 } else if delete_pressed {
                     self.sort_photos(ActionKind::Delete, ctx);
                 } else if open_pressed {
-                    if !self.photos.is_empty() {
-                        self.current = self
-                            .anchor
-                            .or_else(|| self.selection.iter().next().copied())
-                            .unwrap_or(self.current)
-                            .min(self.photos.len() - 1);
+                    if let Some(cursor) = self.grid_cursor() {
+                        self.current = cursor;
                         self.mode = ViewMode::Viewer;
                         self.last_viewer_image = None;
                     }
                 } else if let Some(direction) = direction {
-                    if !self.photos.is_empty() {
-                        let current = self
-                            .anchor
-                            .or_else(|| self.selection.iter().next().copied())
-                            .unwrap_or(0)
-                            .min(self.photos.len() - 1);
-                        let target = (current as isize + direction)
-                            .clamp(0, self.photos.len() as isize - 1)
-                            as usize;
+                    if let Some(current) = self.grid_cursor() {
+                        let (target, goal) = self.grid_move(current, direction.0, direction.1);
                         self.select(target, modifiers);
+                        self.column_goal = goal;
                         self.current = target;
                         self.scroll_to_selection = true;
                     }
@@ -3202,6 +3258,49 @@ mod tests {
         assert_eq!(oriented_dimensions((2, 3), 6), (3, 2));
         assert_eq!(oriented_dimensions((2, 3), 8), (3, 2));
         assert_eq!(oriented_dimensions((2, 3), 4), (2, 3));
+    }
+
+    #[test]
+    fn grid_vertical_moves_follow_the_column_across_folders() {
+        let mut app = SorterApp::default();
+        let photo = |folder: &str, name: &str| Photo {
+            display: PathBuf::from(folder).join(name),
+            files: Vec::new(),
+            subfolder: PathBuf::from(folder),
+            datetime: None,
+            exif: Vec::new(),
+            exif_loaded: false,
+            kept: false,
+        };
+        // 4 columns: folder a has 6 photos (rows 4 + 2), folder b has 5 (rows 4 + 1).
+        app.photos = (0..6)
+            .map(|i| photo("a", &format!("{i}.jpg")))
+            .chain((0..5).map(|i| photo("b", &format!("{i}.jpg"))))
+            .collect();
+        app.grid_columns = 4;
+        // Column 3 of folder a, row 0: down goes to a[?] short row (clamped), then into b row 0.
+        let (index, goal) = app.grid_move(3, 0, 1);
+        assert_eq!(index, 5);
+        app.column_goal = goal;
+        let (index, goal) = app.grid_move(index, 0, 1);
+        assert_eq!(index, 6 + 3);
+        app.column_goal = goal;
+        // Down from b row 0 col 3 reaches the short second row (clamped), then up returns to col 3.
+        let (index, goal) = app.grid_move(index, 0, 1);
+        assert_eq!(index, 10);
+        app.column_goal = goal;
+        let (index, goal) = app.grid_move(index, 0, -1);
+        assert_eq!(index, 9);
+        app.column_goal = goal;
+        // Up from the first row of b lands on the last row of a, same column (clamped).
+        let (index, goal) = app.grid_move(index, 0, -1);
+        assert_eq!(index, 5);
+        app.column_goal = goal;
+        let (index, _) = app.grid_move(index, 0, -1);
+        assert_eq!(index, 3);
+        // Left/right still step one photo at a time and clamp at the ends.
+        assert_eq!(app.grid_move(5, 1, 0).0, 6);
+        assert_eq!(app.grid_move(0, -1, 0).0, 0);
     }
 
     #[test]
