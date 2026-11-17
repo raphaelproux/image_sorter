@@ -28,7 +28,7 @@ A lightweight Linux app (Rust, egui/eframe) to explore and sort images in folder
 | Arrow keys | Move the selection in the grid / previous and next photo in the viewer |
 | `Shift` + click or arrows | Extend the selection (grid) |
 | `Ctrl` + click | Add to / remove from the selection (grid) |
-| Double-click | Open a photo in the viewer / go back to the grid |
+| Double-click, `Enter` or `Space` | Open the selected photo in the viewer (double-click also goes back to the grid) |
 | `Esc` | Back to the grid from the viewer |
 | `Ctrl+Z` | Undo |
 | `Ctrl+,` | Open the settings |

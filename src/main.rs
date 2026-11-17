@@ -2537,6 +2537,9 @@ impl eframe::App for SorterApp {
             let delete_pressed = pressed
                 .iter()
                 .any(|key| Self::shortcut_matches(&self.settings.delete_shortcut, *key));
+            let open_pressed = pressed
+                .iter()
+                .any(|key| matches!(key, Key::Enter | Key::Space));
             if self.mode == ViewMode::Grid {
                 if keep_pressed {
                     self.sort_photos(ActionKind::Keep, ctx);
@@ -2544,6 +2547,16 @@ impl eframe::App for SorterApp {
                     self.leave_photo();
                 } else if delete_pressed {
                     self.sort_photos(ActionKind::Delete, ctx);
+                } else if open_pressed {
+                    if !self.photos.is_empty() {
+                        self.current = self
+                            .anchor
+                            .or_else(|| self.selection.iter().next().copied())
+                            .unwrap_or(self.current)
+                            .min(self.photos.len() - 1);
+                        self.mode = ViewMode::Viewer;
+                        self.last_viewer_image = None;
+                    }
                 } else if let Some(direction) = direction {
                     if !self.photos.is_empty() {
                         let current = self
