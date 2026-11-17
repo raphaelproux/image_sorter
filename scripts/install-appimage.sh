@@ -2,6 +2,15 @@
 set -euo pipefail
 
 APP_NAME="image_sorter"
+MODE="install"
+if [[ "${1:-}" == "--update" ]]; then
+    MODE="update"
+    shift
+fi
+if (( $# > 1 )); then
+    printf 'Usage: %s [--update] [/path/to/image_sorter.AppImage]\n' "$0" >&2
+    exit 1
+fi
 APPIMAGE_PATH="${1:-}"
 
 if [[ -z "$APPIMAGE_PATH" ]]; then
@@ -22,6 +31,10 @@ BIN_HOME="$HOME/.local/bin"
 APP_DIR="$HOME/.local/opt/$APP_NAME"
 ICON_DIR="$DATA_HOME/icons/hicolor/512x512/apps"
 DESKTOP_DIR="$DATA_HOME/applications"
+if [[ "$MODE" == "update" && ! -f "$APP_DIR/$APP_NAME.AppImage" ]]; then
+    printf 'Image Sorter is not installed at %s; run this script without --update first.\n' "$APP_DIR/$APP_NAME.AppImage" >&2
+    exit 1
+fi
 EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$EXTRACT_DIR"' EXIT
 
@@ -73,5 +86,9 @@ elif command -v kbuildsycoca5 >/dev/null 2>&1; then
     kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
 fi
 
-printf 'Installed Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+if [[ "$MODE" == "update" ]]; then
+    printf 'Updated Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+else
+    printf 'Installed Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+fi
 printf 'Ensure %s is in PATH to launch it by command name.\n' "$BIN_HOME"

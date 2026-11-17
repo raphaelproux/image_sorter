@@ -29,6 +29,9 @@ const MAX_TEXTURE_MEMORY: usize = 512 * 1024 * 1024;
 const VIEW_PREVIEW: (u32, u32) = (320, 240);
 const ACTIVE_VIEW_PREVIEW_PRIORITY: u8 = 250;
 const PREFETCH_PRIORITY: u8 = 80;
+const PREFETCH_MIN_PRIORITY: u8 = 60;
+const PREFETCH_AHEAD: usize = 3;
+const PREFETCH_BEHIND: usize = 2;
 const ACTIVE_VIEW_IMAGE_PRIORITY: u8 = 240;
 const MAX_TEXTURE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PREVIEW_QUEUE: usize = 512;
@@ -1830,6 +1833,31 @@ impl SorterApp {
             .sum()
     }
 
+    fn retain_prefetch(&mut self, wanted: &HashSet<PathBuf>) {
+        let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
+            let mut removed = Vec::new();
+            let mut retained = Vec::new();
+            for job in std::mem::take(&mut queue.jobs) {
+                let is_prefetch = (PREFETCH_MIN_PRIORITY..=PREFETCH_PRIORITY)
+                    .contains(&job.priority)
+                    && job.size != VIEW_PREVIEW;
+                if is_prefetch && !wanted.contains(&job.key.path) {
+                    queue.active.remove(&job.key);
+                    removed.push(job.key);
+                } else {
+                    retained.push(job);
+                }
+            }
+            queue.jobs = retained;
+            removed
+        } else {
+            Vec::new()
+        };
+        for key in removed {
+            self.queued_textures.remove(&key);
+        }
+    }
+
     fn prioritize_viewer_image(&mut self, path: &Path) {
         let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
             let mut removed = Vec::new();
@@ -2710,17 +2738,41 @@ impl eframe::App for SorterApp {
                 };
                 if self.zoom <= 1.0 && self.photos.len() > 1 {
                     let count = self.photos.len();
-                    for neighbour in [
-                        (self.current + 1) % count,
-                        (self.current + count - 1) % count,
-                    ] {
+                    let mut neighbours: Vec<(usize, u8)> = Vec::new();
+                    for distance in 1..=PREFETCH_AHEAD.max(PREFETCH_BEHIND) {
+                        let step = (distance - 1) as u8 * 8;
+                        if distance <= PREFETCH_AHEAD {
+                            neighbours.push((
+                                (self.current + distance) % count,
+                                PREFETCH_PRIORITY.saturating_sub(step),
+                            ));
+                        }
+                        if distance <= PREFETCH_BEHIND {
+                            neighbours.push((
+                                (self.current + count - distance % count) % count,
+                                (PREFETCH_PRIORITY - 4).saturating_sub(step),
+                            ));
+                        }
+                    }
+                    let mut seen = HashSet::from([self.current]);
+                    neighbours.retain(|(index, _)| seen.insert(*index));
+                    let wanted: HashSet<PathBuf> = neighbours
+                        .iter()
+                        .map(|(index, _)| self.photos[*index].display.clone())
+                        .collect();
+                    self.retain_prefetch(&wanted);
+                    for (neighbour, priority) in neighbours {
                         let path = self.photos[neighbour].display.clone();
+                        if !self.source_sizes.contains_key(&path) {
+                            self.request_source_info(ctx, &path);
+                            continue;
+                        }
                         let source = self.source_size(ctx, &path);
                         self.texture(
                             ctx,
                             &path,
                             viewer_request_size(source, viewport, 1.0),
-                            PREFETCH_PRIORITY,
+                            priority.max(PREFETCH_MIN_PRIORITY),
                         );
                     }
                 }

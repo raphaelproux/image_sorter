@@ -3,6 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="image_sorter"
+MODE="install"
+if [[ "${1:-}" == "--update" ]]; then
+    MODE="update"
+    shift
+fi
+if (( $# > 0 )); then
+    printf 'Usage: %s [--update]\n' "$0" >&2
+    exit 1
+fi
 BIN_HOME="${BIN_HOME:-$HOME/.local/bin}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 ICON_DIR="$DATA_HOME/icons/hicolor/512x512/apps"
@@ -15,6 +24,11 @@ fi
 
 if [[ ! -r /etc/os-release ]] || ! . /etc/os-release || [[ "${ID:-}" != "solus" ]]; then
     printf 'This installer is intended for Solus OS.\n' >&2
+    exit 1
+fi
+
+if [[ "$MODE" == "update" && ! -x "$BIN_HOME/$APP_NAME" ]]; then
+    printf 'Image Sorter is not installed at %s; run this script without --update first.\n' "$BIN_HOME/$APP_NAME" >&2
     exit 1
 fi
 
@@ -50,4 +64,8 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
 fi
 
-printf 'Installed Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+if [[ "$MODE" == "update" ]]; then
+    printf 'Updated Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+else
+    printf 'Installed Image Sorter. Launch it from your application menu or run: %s\n' "$BIN_HOME/$APP_NAME"
+fi
