@@ -29,7 +29,7 @@ A lightweight Linux app (Rust, egui/eframe) to explore and sort images in folder
 | `Shift` + click or arrows | Extend the selection (grid) |
 | `Ctrl` + click | Add to / remove from the selection (grid) |
 | Double-click, `Enter` or `Space` | Open the selected photo in the viewer (double-click also goes back to the grid) |
-| `Esc` | Back to the grid from the viewer |
+| `Esc` or `Space` | Back to the grid from the viewer |
 | `Ctrl+Z` | Undo |
 | `Ctrl+,` | Open the settings |
 

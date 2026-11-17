@@ -2579,7 +2579,9 @@ impl eframe::App for SorterApp {
             } else if delete_pressed {
                 self.sort_photos(ActionKind::Delete, ctx);
             } else {
-                if ctx.input(|input| input.key_pressed(Key::Escape)) {
+                if ctx.input(|input| {
+                    input.key_pressed(Key::Escape) || input.key_pressed(Key::Space)
+                }) {
                     self.show_grid();
                 }
                 if right {
