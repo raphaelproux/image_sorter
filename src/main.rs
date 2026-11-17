@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -32,6 +32,7 @@ const PREFETCH_PRIORITY: u8 = 80;
 const ACTIVE_VIEW_IMAGE_PRIORITY: u8 = 240;
 const MAX_TEXTURE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PREVIEW_QUEUE: usize = 512;
+const KEEP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 struct Photo {
@@ -40,6 +41,7 @@ struct Photo {
     subfolder: PathBuf,
     datetime: Option<String>,
     exif: Vec<(exif::Tag, String, String)>,
+    exif_loaded: bool,
     kept: bool,
 }
 
@@ -114,6 +116,17 @@ fn default_show_filenames() -> bool {
     true
 }
 
+fn loading_indicator(ui: &mut egui::Ui, rect: egui::Rect, label: &str) {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.spinner();
+                ui.label(label);
+            });
+        });
+    });
+}
+
 fn status_text(notice: &str) -> egui::RichText {
     let is_error = [
         "Choose a source folder",
@@ -183,8 +196,14 @@ struct SorterApp {
     previous_folder: Option<PathBuf>,
     scan_receiver: Receiver<(usize, PathBuf, Vec<Photo>)>,
     scan_sender: Sender<(usize, PathBuf, Vec<Photo>)>,
+    exif_receiver: Receiver<(usize, PathBuf, Vec<(exif::Tag, String, String)>)>,
+    exif_sender: Sender<(usize, PathBuf, Vec<(exif::Tag, String, String)>)>,
+    source_info_receiver: Receiver<(PathBuf, (u32, u32), u64)>,
+    source_info_sender: Sender<(PathBuf, (u32, u32), u64)>,
+    pending_source_info: HashSet<PathBuf>,
+    pending_exif: HashSet<PathBuf>,
     scan_generation: usize,
-    texture_receiver: Receiver<(TextureKey, Option<ColorImage>)>,
+    texture_receiver: Receiver<(TextureKey, TextureKey, Option<ColorImage>)>,
     queued_textures: HashSet<TextureKey>,
     preview_pool: Arc<PreviewPool>,
     operation_sender: Sender<OperationMessage>,
@@ -196,6 +215,7 @@ struct SorterApp {
     scroll_to_selection: bool,
     grid_columns: usize,
     source_sizes: HashMap<PathBuf, (u32, u32)>,
+    texture_fingerprints: HashMap<PathBuf, u64>,
     expanded_exif: HashSet<String>,
 }
 
@@ -215,6 +235,8 @@ impl Default for SorterApp {
                 show_filenames: true,
             });
         let (scan_sender, scan_receiver) = mpsc::channel();
+        let (exif_sender, exif_receiver) = mpsc::channel();
+        let (source_info_sender, source_info_receiver) = mpsc::channel();
         let (keep_scan_sender, keep_scan_receiver) = mpsc::channel();
         let (texture_sender, texture_receiver) = mpsc::channel();
         let (operation_sender, operation_receiver) = mpsc::channel();
@@ -225,8 +247,8 @@ impl Default for SorterApp {
         });
         let preview_cache = preview_cache_path();
         let worker_count = std::thread::available_parallelism()
-            .map_or(2, usize::from)
-            .clamp(2, 3);
+            .map_or(4, usize::from)
+            .clamp(4, 6);
         for _ in 0..worker_count {
             let pool = Arc::clone(&preview_pool);
             let sender = texture_sender.clone();
@@ -262,6 +284,12 @@ impl Default for SorterApp {
             previous_folder: None,
             scan_receiver,
             scan_sender,
+            exif_receiver,
+            exif_sender,
+            source_info_receiver,
+            source_info_sender,
+            pending_source_info: HashSet::new(),
+            pending_exif: HashSet::new(),
             scan_generation: 0,
             texture_receiver,
             queued_textures: HashSet::new(),
@@ -275,6 +303,7 @@ impl Default for SorterApp {
             scroll_to_selection: false,
             grid_columns: 1,
             source_sizes: HashMap::new(),
+            texture_fingerprints: HashMap::new(),
             expanded_exif: HashSet::new(),
         }
     }
@@ -319,19 +348,113 @@ fn move_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
-fn exif_orientation(path: &Path) -> u32 {
-    let Some(file) = fs::File::open(path).ok() else {
-        return 1;
+const HEAD_BYTES: usize = 256 * 1024;
+const BYTES_CACHE_BUDGET: usize = 128 * 1024 * 1024;
+const BYTES_CACHE_MAX_ENTRY: usize = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+struct CachedBytes {
+    data: Arc<Vec<u8>>,
+    complete: bool,
+}
+
+static BYTES_CACHE: std::sync::Mutex<Vec<(PathBuf, CachedBytes)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn bytes_cache_get(path: &Path) -> Option<CachedBytes> {
+    let mut cache = BYTES_CACHE.lock().ok()?;
+    let position = cache.iter().position(|(cached, _)| cached == path)?;
+    let entry = cache.remove(position);
+    let value = entry.1.clone();
+    cache.push(entry);
+    Some(value)
+}
+
+fn bytes_cache_put(path: &Path, value: &CachedBytes) {
+    if value.data.len() > BYTES_CACHE_MAX_ENTRY {
+        return;
+    }
+    if let Ok(mut cache) = BYTES_CACHE.lock() {
+        cache.retain(|(cached, _)| cached != path);
+        cache.push((path.to_path_buf(), value.clone()));
+        let mut total: usize = cache.iter().map(|(_, entry)| entry.data.len()).sum();
+        while total > BYTES_CACHE_BUDGET && cache.len() > 1 {
+            total -= cache.remove(0).1.data.len();
+        }
+    }
+}
+
+fn bytes_cache_clear() {
+    if let Ok(mut cache) = BYTES_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+fn is_jpeg(path: &Path) -> bool {
+    matches!(extension(path).as_str(), "jpg" | "jpeg")
+}
+
+/// Reads the first bytes of a file with a single open and one large read: network
+/// filesystems pay a round trip per open and per small read.
+fn load_prefix(path: &Path) -> Option<CachedBytes> {
+    if let Some(cached) = bytes_cache_get(path) {
+        return Some(cached);
+    }
+    let mut data = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(HEAD_BYTES as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    let value = CachedBytes {
+        complete: data.len() < HEAD_BYTES,
+        data: Arc::new(data),
     };
+    bytes_cache_put(path, &value);
+    Some(value)
+}
+
+fn load_full(path: &Path) -> Option<Arc<Vec<u8>>> {
+    if let Some(cached) = bytes_cache_get(path) {
+        if cached.complete {
+            return Some(cached.data);
+        }
+    }
+    let value = CachedBytes {
+        data: Arc::new(fs::read(path).ok()?),
+        complete: true,
+    };
+    bytes_cache_put(path, &value);
+    Some(value.data)
+}
+
+fn parse_exif(bytes: &[u8]) -> Option<exif::Exif> {
     exif::Reader::new()
-        .read_from_container(&mut BufReader::new(file))
+        .read_from_container(&mut std::io::Cursor::new(bytes))
         .ok()
-        .and_then(|exif| {
-            exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                .and_then(|field| field.value.get_uint(0))
-        })
-        .filter(|orientation| (1..=8).contains(orientation))
-        .unwrap_or(1)
+}
+
+fn orientation_of(exif: Option<&exif::Exif>) -> u32 {
+    exif.and_then(|exif| {
+        exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|field| field.value.get_uint(0))
+    })
+    .filter(|orientation| (1..=8).contains(orientation))
+    .unwrap_or(1)
+}
+
+fn image_dimensions(path: &Path, bytes: &[u8]) -> Option<(u32, u32)> {
+    if is_jpeg(path) {
+        let mut decoder = JpegDecoder::new(std::io::Cursor::new(bytes));
+        decoder.read_info().ok()?;
+        let info = decoder.info()?;
+        Some((info.width as u32, info.height as u32))
+    } else {
+        let reader = ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        Some(reader.into_decoder().ok()?.dimensions())
+    }
 }
 
 fn oriented_dimensions(dimensions: (u32, u32), orientation: u32) -> (u32, u32) {
@@ -355,11 +478,7 @@ fn apply_exif_orientation(image: image::DynamicImage, orientation: u32) -> image
     }
 }
 
-fn embedded_thumbnail(path: &Path, orientation: u32) -> Option<ColorImage> {
-    let file = fs::File::open(path).ok()?;
-    let exif = exif::Reader::new()
-        .read_from_container(&mut BufReader::new(file))
-        .ok()?;
+fn embedded_thumbnail(exif: &exif::Exif, orientation: u32) -> Option<ColorImage> {
     let offset = exif
         .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
         .value
@@ -414,13 +533,6 @@ fn decode_jpeg<R: Read>(reader: R, target: Option<(u32, u32)>) -> Option<image::
         }
         JpegPixelFormat::L16 => None,
     }
-}
-
-fn jpeg_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let mut decoder = JpegDecoder::new(BufReader::new(fs::File::open(path).ok()?));
-    decoder.read_info().ok()?;
-    let info = decoder.info()?;
-    Some((info.width as u32, info.height as u32))
 }
 
 fn exif_tag_name(tag: exif::Tag) -> String {
@@ -537,6 +649,8 @@ fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<Str
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let content_width = ui.available_width();
+            ui.set_max_width(content_width);
             for category in EXIF_CATEGORIES {
                 let fields: Vec<_> = photo
                     .exif
@@ -585,7 +699,8 @@ fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<Str
                                     egui::FontSelection::Default,
                                     egui::Align::BOTTOM,
                                 );
-                            ui.label(row);
+                            row.wrap.break_anywhere = true;
+                            ui.add(egui::Label::new(row).wrap());
                             if long && !is_expanded && ui.small_button("Expand").clicked() {
                                 expanded.insert(key.clone());
                             } else if long && is_expanded && ui.small_button("Collapse").clicked() {
@@ -599,10 +714,14 @@ fn show_exif_fields(ui: &mut egui::Ui, photo: &Photo, expanded: &mut HashSet<Str
 }
 
 fn read_exif(path: &Path) -> Vec<(exif::Tag, String, String)> {
-    let Ok(file) = fs::File::open(path) else {
+    let Some(prefix) = load_prefix(path) else {
         return Vec::new();
     };
-    let Ok(exif) = exif::Reader::new().read_from_container(&mut BufReader::new(file)) else {
+    let mut exif = parse_exif(&prefix.data);
+    if exif.is_none() && !prefix.complete && !is_jpeg(path) {
+        exif = load_full(path).and_then(|data| parse_exif(&data));
+    }
+    let Some(exif) = exif else {
         return Vec::new();
     };
     exif.fields()
@@ -797,7 +916,24 @@ fn preview_cache_path() -> PathBuf {
         .join("previews")
 }
 
+fn path_fingerprint(path: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    2u8.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
 fn texture_key(path: &Path, size: (u32, u32)) -> TextureKey {
+    TextureKey {
+        path: path.to_path_buf(),
+        width: size.0,
+        height: size.1,
+        fingerprint: path_fingerprint(path),
+    }
+}
+
+fn texture_fingerprint(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     if let Ok(metadata) = fs::metadata(path) {
@@ -810,23 +946,19 @@ fn texture_key(path: &Path, size: (u32, u32)) -> TextureKey {
             .hash(&mut hasher);
     }
     2u8.hash(&mut hasher);
-    TextureKey {
-        path: path.to_path_buf(),
-        width: size.0,
-        height: size.1,
-        fingerprint: hasher.finish(),
-    }
+    hasher.finish()
 }
 
 fn viewer_decode_size(path: &Path) -> Option<(u32, u32)> {
-    let dimensions = if matches!(extension(path).as_str(), "jpg" | "jpeg") {
-        jpeg_dimensions(path)?
-    } else {
-        let reader = ImageReader::open(path).ok()?;
-        let decoder = reader.into_decoder().ok()?;
-        decoder.dimensions()
-    };
-    Some(oriented_dimensions(dimensions, exif_orientation(path)))
+    let prefix = load_prefix(path)?;
+    let mut data = prefix.data.clone();
+    let mut dimensions = image_dimensions(path, &data);
+    if dimensions.is_none() && !prefix.complete {
+        data = load_full(path)?;
+        dimensions = image_dimensions(path, &data);
+    }
+    let orientation = orientation_of(parse_exif(&data).as_ref());
+    Some(oriented_dimensions(dimensions?, orientation))
 }
 
 fn viewer_request_size(source: (u32, u32), viewport: (u32, u32), zoom: f32) -> (u32, u32) {
@@ -975,9 +1107,9 @@ fn trim_preview_cache(cache: &Path, pool: &PreviewPool) {
 
 fn job_timeout(priority: u8) -> std::time::Duration {
     if priority >= ACTIVE_VIEW_PREVIEW_PRIORITY {
-        std::time::Duration::from_secs(5)
+        std::time::Duration::from_secs(30)
     } else {
-        std::time::Duration::from_secs(15)
+        std::time::Duration::from_secs(90)
     }
 }
 
@@ -1052,7 +1184,7 @@ fn enqueue_preview(
 
 fn preview_worker(
     pool: Arc<PreviewPool>,
-    sender: Sender<(TextureKey, Option<ColorImage>)>,
+    sender: Sender<(TextureKey, TextureKey, Option<ColorImage>)>,
     cache: PathBuf,
 ) {
     loop {
@@ -1068,12 +1200,16 @@ fn preview_worker(
             }
             queue.jobs.remove(0)
         };
+        let actual_key = TextureKey {
+            fingerprint: texture_fingerprint(&job.key.path),
+            ..job.key.clone()
+        };
         let image = if job.deadline <= std::time::Instant::now() {
             None
         } else {
             let cacheable = job.size == VIEW_PREVIEW;
             let cached = if cacheable {
-                read_cached_preview(&cache, &job.key)
+                read_cached_preview(&cache, &actual_key)
             } else {
                 None
             };
@@ -1083,12 +1219,12 @@ fn preview_worker(
                     return None;
                 }
                 if cacheable {
-                    write_cached_preview(&cache, &job.key, &image, &pool);
+                    write_cached_preview(&cache, &actual_key, &image, &pool);
                 }
                 Some(image)
             })
         };
-        if sender.send((job.key.clone(), image)).is_err() {
+        if sender.send((job.key.clone(), actual_key, image)).is_err() {
             return;
         }
         job.repaint.request_repaint();
@@ -1209,28 +1345,61 @@ fn decode_cached_thumbnail_png(data: &[u8]) -> Option<image::DynamicImage> {
     Some(image::DynamicImage::ImageRgba8(decoded))
 }
 
+fn quick_preview(
+    path: &Path,
+    exif: Option<&exif::Exif>,
+    orientation: u32,
+    allow_system: bool,
+) -> Option<ColorImage> {
+    if allow_system && orientation == 1 {
+        if let Some(thumbnail) = system_thumbnail(path) {
+            return Some(thumbnail);
+        }
+    }
+    embedded_thumbnail(exif?, orientation)
+}
+
 fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
-    let orientation = exif_orientation(path);
+    let prefix = if size == VIEW_PREVIEW {
+        load_prefix(path)?
+    } else {
+        CachedBytes {
+            data: load_full(path)?,
+            complete: true,
+        }
+    };
+    let mut exif = parse_exif(&prefix.data);
+    let mut orientation = orientation_of(exif.as_ref());
+    if size == VIEW_PREVIEW {
+        if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, true) {
+            return Some(thumbnail);
+        }
+    }
+    let data = if prefix.complete {
+        prefix.data
+    } else {
+        load_full(path)?
+    };
+    if !prefix.complete && !is_jpeg(path) {
+        exif = parse_exif(&data);
+        orientation = orientation_of(exif.as_ref());
+        if size == VIEW_PREVIEW {
+            if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, false) {
+                return Some(thumbnail);
+            }
+        }
+    }
     let output_target = if size == VIEW_PREVIEW && matches!(orientation, 5..=8) {
         (size.1, size.0)
     } else {
         size
     };
-    if size == VIEW_PREVIEW {
-        if orientation == 1 {
-            if let Some(thumbnail) = system_thumbnail(path) {
-                return Some(thumbnail);
-            }
-        }
-        if let Some(thumbnail) = embedded_thumbnail(path, orientation) {
-            return Some(thumbnail);
-        }
-    }
-    let decoded = if matches!(extension(path).as_str(), "jpg" | "jpeg") {
+    let decoded = if is_jpeg(path) {
         let requested = if size == VIEW_PREVIEW {
             output_target
         } else {
-            viewer_decode_size(path)
+            image_dimensions(path, &data)
+                .map(|source| oriented_dimensions(source, orientation))
                 .map_or(size, |source| (size.0.min(source.0), size.1.min(source.1)))
         };
         let decode_target = if matches!(orientation, 5..=8) {
@@ -1239,10 +1408,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
             requested
         };
         let image = apply_exif_orientation(
-            decode_jpeg(
-                BufReader::new(fs::File::open(path).ok()?),
-                Some(decode_target),
-            )?,
+            decode_jpeg(std::io::Cursor::new(&data[..]), Some(decode_target))?,
             orientation,
         );
         if image.width() > requested.0 || image.height() > requested.1 {
@@ -1251,7 +1417,9 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
             image
         }
     } else {
-        let mut reader = ImageReader::open(path).ok()?;
+        let mut reader = ImageReader::new(std::io::Cursor::new(&data[..]))
+            .with_guessed_format()
+            .ok()?;
         reader.no_limits();
         let decoder = reader.into_decoder().ok()?;
         let dimensions = decoder.dimensions();
@@ -1269,7 +1437,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
         let target = if size == VIEW_PREVIEW {
             size
         } else {
-            viewer_decode_size(path)?
+            oriented_dimensions(dimensions, orientation)
         };
         if pixels.width() <= target.0 && pixels.height() <= target.1 && size != VIEW_PREVIEW {
             pixels
@@ -1370,13 +1538,13 @@ fn scan_folder(root: &Path) -> Vec<Photo> {
             };
             let display = group[display_index].clone();
             let relative = folder.strip_prefix(root).unwrap_or(&folder).to_path_buf();
-            let exif = read_exif(&display);
             photos.push(Photo {
-                datetime: exif_datetime(&exif),
                 display,
                 files: group,
                 subfolder: relative,
-                exif,
+                datetime: None,
+                exif: Vec::new(),
+                exif_loaded: false,
                 kept: false,
             });
         }
@@ -1415,10 +1583,29 @@ impl SorterApp {
         let sender = self.keep_scan_sender.clone();
         let repaint = ctx.clone();
         self.keep_scan_pending = true;
-        self.next_keep_scan = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        self.next_keep_scan = std::time::Instant::now() + KEEP_POLL_INTERVAL;
+        let root = self.root.clone().unwrap_or_default();
+        let snapshot: Vec<Photo> = self
+            .photos
+            .iter()
+            .map(|photo| Photo {
+                display: photo.display.clone(),
+                files: photo.files.clone(),
+                subfolder: PathBuf::new(),
+                datetime: None,
+                exif: Vec::new(),
+                exif_loaded: true,
+                kept: false,
+            })
+            .collect();
         thread::spawn(move || {
             let files = scan_keep_folder(&keep_folder);
-            let _ = sender.send((generation, files));
+            let kept: HashSet<PathBuf> = snapshot
+                .iter()
+                .filter(|photo| is_kept(photo, &root, &keep_folder, &files))
+                .map(|photo| photo.display.clone())
+                .collect();
+            let _ = sender.send((generation, kept));
             repaint.request_repaint();
         });
     }
@@ -1465,18 +1652,12 @@ impl SorterApp {
         while let Ok(result) = self.keep_scan_receiver.try_recv() {
             latest = Some(result);
         }
-        if let Some((generation, files)) = latest {
+        if let Some((generation, kept)) = latest {
             self.keep_scan_pending = false;
-            self.next_keep_scan = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            self.next_keep_scan = std::time::Instant::now() + KEEP_POLL_INTERVAL;
             if generation == self.keep_scan_generation {
-                if let (Some(root), Some(keep_folder)) = (
-                    self.root.as_deref(),
-                    (!self.settings.keep_folder.trim().is_empty())
-                        .then(|| PathBuf::from(self.settings.keep_folder.trim())),
-                ) {
-                    for photo in &mut self.photos {
-                        photo.kept = is_kept(photo, root, &keep_folder, &files);
-                    }
+                for photo in &mut self.photos {
+                    photo.kept = kept.contains(&photo.display);
                 }
             }
         } else if self.keep_scan_pending {
@@ -1492,7 +1673,7 @@ impl SorterApp {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         } else if std::time::Instant::now() >= self.next_keep_scan {
-            self.next_keep_scan = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            self.next_keep_scan = std::time::Instant::now() + KEEP_POLL_INTERVAL;
             self.refresh_kept_status(ctx);
         }
     }
@@ -1507,6 +1688,11 @@ impl SorterApp {
             self.root = Some(folder.clone());
             self.photos.clear();
             self.selection.clear();
+            self.source_sizes.clear();
+            self.texture_fingerprints.clear();
+            self.pending_source_info.clear();
+            self.pending_exif.clear();
+            bytes_cache_clear();
             self.textures.clear();
 
             self.texture_last_used.clear();
@@ -1517,10 +1703,24 @@ impl SorterApp {
             let generation = self.scan_generation;
             let folder_label = folder.display().to_string();
             let sender = self.scan_sender.clone();
+            let exif_sender = self.exif_sender.clone();
             let repaint = ctx.clone();
             thread::spawn(move || {
                 let photos = scan_folder(&folder);
+                let exif_paths: Vec<_> = photos.iter().map(|photo| photo.display.clone()).collect();
                 let _ = sender.send((generation, folder, photos));
+                repaint.request_repaint();
+                let mut last_repaint = std::time::Instant::now();
+                for path in exif_paths {
+                    let fields = read_exif(&path);
+                    if exif_sender.send((generation, path, fields)).is_err() {
+                        break;
+                    }
+                    if last_repaint.elapsed() >= std::time::Duration::from_millis(400) {
+                        repaint.request_repaint();
+                        last_repaint = std::time::Instant::now();
+                    }
+                }
                 repaint.request_repaint();
             });
             self.notice = format!("Scanning {folder_label}…");
@@ -1529,6 +1729,13 @@ impl SorterApp {
     }
 
     fn poll_scan(&mut self, ctx: &egui::Context) {
+        while let Ok((path, size, fingerprint)) = self.source_info_receiver.try_recv() {
+            self.pending_source_info.remove(&path);
+            if self.photos.iter().any(|photo| photo.display == path) {
+                self.source_sizes.insert(path.clone(), size);
+                self.texture_fingerprints.insert(path, fingerprint);
+            }
+        }
         let mut latest = None;
         while let Ok(result) = self.scan_receiver.try_recv() {
             latest = Some(result);
@@ -1539,6 +1746,10 @@ impl SorterApp {
                 self.photos = photos;
                 self.refresh_kept_status(ctx);
                 self.textures.clear();
+                self.source_sizes.clear();
+                self.texture_fingerprints.clear();
+                self.pending_source_info.clear();
+                self.pending_exif.clear();
 
                 self.texture_last_used.clear();
                 self.queued_textures.clear();
@@ -1548,12 +1759,40 @@ impl SorterApp {
         } else if self.root.is_some() && self.notice.starts_with("Scanning ") {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        let mut updates = Vec::new();
+        while let Ok(update) = self.exif_receiver.try_recv() {
+            updates.push(update);
+        }
+        if !updates.is_empty() {
+            let positions: HashMap<PathBuf, usize> = self
+                .photos
+                .iter()
+                .enumerate()
+                .map(|(index, photo)| (photo.display.clone(), index))
+                .collect();
+            for (generation, path, fields) in updates {
+                self.pending_exif.remove(&path);
+                if generation != self.scan_generation {
+                    continue;
+                }
+                if let Some(photo) = positions
+                    .get(&path)
+                    .and_then(|index| self.photos.get_mut(*index))
+                {
+                    photo.datetime = exif_datetime(&fields);
+                    photo.exif = fields;
+                    photo.exif_loaded = true;
+                }
+            }
+        }
     }
 
     fn poll_textures(&mut self, ctx: &egui::Context) {
-        while let Ok((key, image)) = self.texture_receiver.try_recv() {
+        while let Ok((requested_key, key, image)) = self.texture_receiver.try_recv() {
             if let Some(image) = image {
                 if self.photos.iter().any(|photo| photo.display == key.path) {
+                    self.texture_fingerprints
+                        .insert(key.path.clone(), key.fingerprint);
                     let texture =
                         ctx.load_texture(texture_name(&key), image, TextureOptions::LINEAR);
                     self.textures.insert(key.clone(), texture);
@@ -1574,9 +1813,9 @@ impl SorterApp {
                     }
                 }
             }
-            self.queued_textures.remove(&key);
+            self.queued_textures.remove(&requested_key);
             if let Ok(mut queue) = self.preview_pool.queue.lock() {
-                queue.active.remove(&key);
+                queue.active.remove(&requested_key);
             }
         }
     }
@@ -1613,8 +1852,50 @@ impl SorterApp {
         }
     }
 
+    fn request_exif(&mut self, ctx: &egui::Context, path: &Path, generation: usize) {
+        if !self.pending_exif.insert(path.to_path_buf()) {
+            return;
+        }
+        let path = path.to_path_buf();
+        let sender = self.exif_sender.clone();
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let fields = read_exif(&path);
+            let _ = sender.send((generation, path, fields));
+            repaint.request_repaint();
+        });
+    }
+
+    fn request_source_info(&mut self, ctx: &egui::Context, path: &Path) {
+        if !self.pending_source_info.insert(path.to_path_buf()) {
+            return;
+        }
+        let path = path.to_path_buf();
+        let sender = self.source_info_sender.clone();
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let size = viewer_decode_size(&path).unwrap_or(VIEW_PREVIEW);
+            let fingerprint = texture_fingerprint(&path);
+            let _ = sender.send((path, size, fingerprint));
+            repaint.request_repaint();
+        });
+    }
+
+    fn cached_texture_key(&mut self, path: &Path, size: (u32, u32)) -> TextureKey {
+        let fingerprint = *self
+            .texture_fingerprints
+            .entry(path.to_path_buf())
+            .or_insert_with(|| path_fingerprint(path));
+        TextureKey {
+            path: path.to_path_buf(),
+            width: size.0,
+            height: size.1,
+            fingerprint,
+        }
+    }
+
     fn texture(&mut self, ctx: &egui::Context, path: &Path, size: (u32, u32), priority: u8) {
-        let key = texture_key(path, size);
+        let key = self.cached_texture_key(path, size);
         if let Some(existing) = self.textures.keys().find(|existing| {
             existing.path == path
                 && existing.fingerprint == key.fingerprint
@@ -1652,17 +1933,16 @@ impl SorterApp {
         }
     }
 
-    fn source_size(&mut self, path: &Path) -> (u32, u32) {
+    fn source_size(&mut self, ctx: &egui::Context, path: &Path) -> (u32, u32) {
         if let Some(size) = self.source_sizes.get(path) {
             return *size;
         }
-        let size = viewer_decode_size(path).unwrap_or(VIEW_PREVIEW);
-        self.source_sizes.insert(path.to_path_buf(), size);
-        size
+        self.request_source_info(ctx, path);
+        VIEW_PREVIEW
     }
 
     fn viewer_texture(&mut self, path: &Path, target: (u32, u32)) -> Option<TextureHandle> {
-        let fingerprint = texture_key(path, (0, 0)).fingerprint;
+        let fingerprint = self.cached_texture_key(path, (0, 0)).fingerprint;
         let best = self
             .textures
             .iter()
@@ -2110,25 +2390,6 @@ impl eframe::App for SorterApp {
                 }
                 if ui.checkbox(&mut self.settings.show_exif, "EXIF").changed() {
                     self.save_settings();
-                    if self.settings.show_exif {
-                        if self.mode == ViewMode::Viewer {
-                            if let Some(photo) = self.photos.get(self.current) {
-                                let fields = read_exif(&photo.display);
-                                if let Some(photo) = self.photos.get_mut(self.current) {
-                                    photo.exif = fields;
-                                }
-                            }
-                        } else if self.selection.len() == 1 {
-                            if let Some(index) = self.selection.iter().next().copied() {
-                                if let Some(photo) = self.photos.get(index) {
-                                    let fields = read_exif(&photo.display);
-                                    if let Some(photo) = self.photos.get_mut(index) {
-                                        photo.exif = fields;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
                 if ui.button(format!("Keep ({})", keep_shortcut)).clicked() {
                     self.sort_photos(ActionKind::Keep, ctx);
@@ -2378,11 +2639,8 @@ impl eframe::App for SorterApp {
                     self.prioritize_viewer_image(&photo.display);
                     self.last_viewer_image = Some(photo.display.clone());
                 }
-                if self.settings.show_exif && photo.exif.is_empty() {
-                    let fields = read_exif(&photo.display);
-                    if let Some(current) = self.photos.get_mut(self.current) {
-                        current.exif = fields;
-                    }
+                if self.settings.show_exif && !photo.exif_loaded {
+                    self.request_exif(ctx, &photo.display, self.scan_generation);
                 }
                 egui::TopBottomPanel::bottom("viewer_actions").show_inside(ui, |ui| {
                     ui.add_space(4.0);
@@ -2422,6 +2680,7 @@ impl eframe::App for SorterApp {
                     .resizable(true)
                     .default_width(340.0)
                     .show_animated_inside(ui, self.settings.show_exif, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.heading("EXIF");
                         show_exif_fields(ui, &photo, &mut self.expanded_exif);
                     });
@@ -2439,12 +2698,16 @@ impl eframe::App for SorterApp {
                 if scroll != 0.0 {
                     self.zoom = (self.zoom * (scroll / 300.0).exp()).clamp(0.1, 8.0);
                 }
-                let source_size = self.source_size(&photo.display);
+                let source_size = self.source_size(ctx, &photo.display);
                 let viewport = (
                     (rect.width() * ctx.pixels_per_point()).round().max(1.0) as u32,
                     (rect.height() * ctx.pixels_per_point()).round().max(1.0) as u32,
                 );
-                let requested_size = viewer_request_size(source_size, viewport, self.zoom);
+                let requested_size = if source_size == VIEW_PREVIEW && !self.source_sizes.contains_key(&photo.display) {
+                    VIEW_PREVIEW
+                } else {
+                    viewer_request_size(source_size, viewport, self.zoom)
+                };
                 if self.zoom <= 1.0 && self.photos.len() > 1 {
                     let count = self.photos.len();
                     for neighbour in [
@@ -2452,7 +2715,7 @@ impl eframe::App for SorterApp {
                         (self.current + count - 1) % count,
                     ] {
                         let path = self.photos[neighbour].display.clone();
-                        let source = self.source_size(&path);
+                        let source = self.source_size(ctx, &path);
                         self.texture(
                             ctx,
                             &path,
@@ -2489,7 +2752,13 @@ impl eframe::App for SorterApp {
                     VIEW_PREVIEW,
                     ACTIVE_VIEW_PREVIEW_PRIORITY,
                 );
-                if let Some(texture) = self.viewer_texture(&photo.display, requested_size) {
+                let texture = self.viewer_texture(&photo.display, requested_size);
+                let loading_image = self.queued_textures.iter().any(|key| {
+                    key.path == photo.display
+                        && key.width >= requested_size.0
+                        && key.height >= requested_size.1
+                });
+                if let Some(texture) = texture {
                     let image_size = texture.size_vec2();
                     let fit = (rect.width() / image_size.x).min(rect.height() / image_size.y);
                     let size = image_size * fit * self.zoom;
@@ -2509,6 +2778,15 @@ impl eframe::App for SorterApp {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
+                    if loading_image {
+                        let indicator_rect = egui::Rect::from_center_size(
+                            rect.center(),
+                            egui::vec2(180.0, 60.0),
+                        );
+                        loading_indicator(ui, indicator_rect, "Loading photo…");
+                    }
+                } else if loading_image {
+                    loading_indicator(ui, rect, "Loading photo…");
                 } else {
                     ui.painter().text(
                         rect.center(),
@@ -2522,9 +2800,14 @@ impl eframe::App for SorterApp {
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 if self.photos.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Choose a folder to scan images recursively.")
-                    });
+                    if self.notice.starts_with("Scanning ") {
+                        let rect = ui.max_rect();
+                        loading_indicator(ui, rect, "Scanning folder…");
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Choose a folder to scan images recursively.")
+                        });
+                    }
                     return;
                 }
                 let mut index = 0;
@@ -2544,6 +2827,7 @@ impl eframe::App for SorterApp {
                             .resizable(true)
                             .default_width(340.0)
                             .show_inside(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.heading("Selected image EXIF");
                                 let selected = if self.selection.len() == 1 {
                                     self.selection.iter().next().copied()
@@ -2554,10 +2838,10 @@ impl eframe::App for SorterApp {
                                     if self
                                         .photos
                                         .get(index)
-                                        .is_some_and(|photo| photo.exif.is_empty())
+                                        .is_some_and(|photo| !photo.exif_loaded)
                                     {
-                                        let fields = read_exif(&self.photos[index].display);
-                                        self.photos[index].exif = fields;
+                                        let path = self.photos[index].display.clone();
+                                        self.request_exif(ctx, &path, self.scan_generation);
                                     }
                                     if let Some(photo) = self.photos.get(index).cloned() {
                                         show_exif_fields(ui, &photo, &mut self.expanded_exif);
@@ -2639,7 +2923,18 @@ impl eframe::App for SorterApp {
                                         if self.photos[index].subfolder != folder {
                                             break;
                                         }
-                                        let photo = self.photos[index].clone();
+                                        let photo = {
+                                            let source = &self.photos[index];
+                                            Photo {
+                                                display: source.display.clone(),
+                                                files: Vec::new(),
+                                                subfolder: PathBuf::new(),
+                                                datetime: source.datetime.clone(),
+                                                exif: Vec::new(),
+                                                exif_loaded: source.exif_loaded,
+                                                kept: source.kept,
+                                            }
+                                        };
                                         let photo_index = index;
                                         let selected = self.selection.contains(&index);
                                         ui.vertical(|ui| {
@@ -2834,6 +3129,7 @@ mod tests {
             subfolder: PathBuf::from("trip"),
             datetime: None,
             exif: Vec::new(),
+            exif_loaded: false,
             kept: false,
         };
         let raw_copy = keep.join("trip/photo.ARW");
@@ -2859,6 +3155,7 @@ mod tests {
             subfolder: PathBuf::new(),
             datetime: datetime.map(str::to_owned),
             exif: Vec::new(),
+            exif_loaded: false,
             kept: false,
         };
         let same = [
