@@ -4,7 +4,7 @@
 Rust (egui/eframe) Linux GUI image sorter (target: Solus OS). Features: recursive folder scan, RAW+JPEG pairing (the JPEG is displayed), grid view grouped by subfolder, image viewer with keep/leave/delete and keyboard shortcuts, Ctrl+Z undo, zoom/pan, EXIF display, settings (keep/delete folders, shortcuts).
 
 ## Project layout
-- `src/main.rs`: the whole app (~1650 lines).
+- `src/main.rs`: the app. `src/grid.rs`: pure grid geometry (`GridLayout`, `group_ranges`) with unit tests.
 - `Cargo.toml`: eframe 0.31 (glow/x11/wayland), image 0.25 [png,gif,bmp,tiff,webp], png 0.18, flate2, jpeg-decoder 0.3 (default-features=false), md5, url, kamadak-exif, native-dialog 0.7, serde (+json), walkdir, notify 6. Dev-dep: image with `jpeg` feature. `[profile.dev] opt-level=2`, dependencies opt-level=3.
 - `EXIF Tags.html`: ExifTool tag reference (ID -> name table, ~651 unique IDs, rows like `<td title='0x0001 = 1'>0x0001</td><td>Name</td>`). Currently unused; tag names come from kamadak-exif `Tag::description()`. A full HTML-derived mapping is an optional improvement.
 - `image_tricks.md`: user-supplied performance guidance (already applied).
@@ -38,6 +38,17 @@ All requested features are implemented. Latest round (all done, `cargo check` an
 - Subfolder titles are bold, 20pt, strong (white-ish) text with a separator. A smaller (13pt) date or date range (`date_range_label`, date part of `Photo.datetime`) is right-aligned on the title row.
 - Grid cells stretch to fill the window width (`cell_width`, min 160px, 4:3 thumbnails). Esc in the viewer, the Grid button, or double-click returns to the grid via `show_grid()`, which selects the last viewed photo and scrolls to it (`scroll_to_selection`).
 - Viewer image is painted with `painter().with_clip_rect(rect)` (rect = free area left after the inner info/actions/EXIF panels) so a zoomed image no longer draws over them.
+
+## Performance strategy (thousands of photos)
+- Grid is virtualized: `show_grid_rows` uses `ScrollArea::show_viewport`; every row has a fixed height (`GridLayout`, cached per `photos_version`/width/toggles), so only intersecting rows are painted (painter calls + `ui.interact`, no widgets). Any code that mutates `photos` (add/remove/reorder) must call `photos_changed()`.
+- `stream_grid_neighbours` requests thumbnails for the viewport (priority 50), then ~3 screens ahead in the scroll direction / 1 behind (30/20), capped at `GRID_PREFETCH_LIMIT`; queued thumbnails that left the window are cancelled (`retain_grid_thumbnails`).
+- `enqueue_preview` promotes already-waiting jobs; workers pick the best job with `take_best_job` (no sort per enqueue).
+- Textures: `HashMap<PathBuf, Vec<TextureEntry>>` + running `texture_bytes` (LRU eviction), at most `MAX_UPLOADS_PER_FRAME` uploads per frame; failed decodes are remembered in `failed_textures` (no retry loop).
+- Dates: no more full EXIF read of every photo at open. `DatetimeScan` (3 threads) reads only the date from the first 128 KB of each JPEG, visible photos first (`prioritize_datetimes`); grid shows "…" until loaded (`Photo.datetime_loaded`). Full EXIF is still lazy (`request_exif`).
+- `photo_index` (path -> index) replaces O(N) lookups; date range labels per folder are cached in `GridLayout.ranges` keyed by `dates_version`.
+
+- RW2 without a JPEG: `rw2_locate`/`rw2_embedded_jpeg` read the embedded full-size JPEG (IFD0 tag 0x2E, orientation 0x112) by byte range; `decode_preview` and `viewer_decode_size` use it, and `parse_exif` patches the RW2 magic (0x55 -> 0x2A) so EXIF/date work. `system_thumbnail_at` still fails on `zTXt`-compressed URIs (harmless now for RW2).
+- Full-res RAW: `decode_raw` develops the file with `imagepipe` (rawloader + demosaic/WB/sRGB; max 2 concurrent via `RawSlot`, side capped at `MAX_RAW_SIDE`). RW2 grid thumbnails and fit-to-window views keep using the embedded JPEG; the RAW is developed only when a bigger size is requested (zoom, `rw2_needs_raw`). `viewer_decode_size` returns the RAW size (`raw_dimensions`, via `decode_dummy`, ~12 ms). Other RAW formats (ARW, CR2, NEF...) go through `decode_raw` directly (untested: no samples).
 
 ## Known caveats / possible follow-ups
 - Photos without any EXIF data are re-read each frame while `show_exif` is on and `exif` is empty (cheap failure, but could be guarded with a "loaded" flag).

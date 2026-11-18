@@ -1,7 +1,10 @@
+mod grid;
+
 use eframe::egui::{
     self, ColorImage, Key, Modifiers, PointerButton, TextureHandle, TextureOptions, Vec2,
 };
 use flate2::read::ZlibDecoder;
+use grid::{group_ranges, GridItemKind, GridLayout, GridMetrics};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use image::{ImageDecoder, ImageReader};
@@ -35,6 +38,12 @@ const PREFETCH_BEHIND: usize = 2;
 const ACTIVE_VIEW_IMAGE_PRIORITY: u8 = 240;
 const MAX_TEXTURE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PREVIEW_QUEUE: usize = 512;
+const GRID_VISIBLE_PRIORITY: u8 = 50;
+const GRID_NEAR_PRIORITY: u8 = 30;
+const DATETIME_WORKERS: usize = 3;
+const MAX_UPLOADS_PER_FRAME: usize = 6;
+const GRID_PREFETCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const GRID_PREFETCH_LIMIT: usize = 400;
 const KEEP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
@@ -45,6 +54,7 @@ struct Photo {
     datetime: Option<String>,
     exif: Vec<(exif::Tag, String, String)>,
     exif_loaded: bool,
+    datetime_loaded: bool,
     kept: bool,
 }
 
@@ -74,6 +84,56 @@ struct TextureKey {
     width: u32,
     height: u32,
     fingerprint: u64,
+}
+
+enum PreviewOutcome {
+    Ready(ColorImage),
+    Failed,
+    Expired,
+}
+
+struct TextureEntry {
+    key: TextureKey,
+    handle: TextureHandle,
+    bytes: usize,
+    last_used: u64,
+}
+
+type DatetimeBatch = (usize, Vec<(PathBuf, Option<String>)>);
+
+#[derive(Default)]
+struct DatetimeState {
+    urgent: Vec<PathBuf>,
+    background: Vec<PathBuf>,
+    taken: HashSet<PathBuf>,
+}
+
+/// Background scan reading only the capture date of every photo. Photos near the viewport are
+/// served first (`urgent`), the rest follows in folder order.
+struct DatetimeScan {
+    state: std::sync::Mutex<DatetimeState>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl DatetimeScan {
+    fn next(&self) -> Option<PathBuf> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            let path = state.urgent.pop().or_else(|| state.background.pop())?;
+            if state.taken.insert(path.clone()) {
+                return Some(path);
+            }
+        }
+    }
+
+    /// `paths` are ordered from the most to the least urgent.
+    fn prioritize(&self, mut paths: Vec<PathBuf>) {
+        if let Ok(mut state) = self.state.lock() {
+            paths.retain(|path| !state.taken.contains(path));
+            paths.reverse();
+            state.urgent = paths;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -189,9 +249,22 @@ struct SorterApp {
     anchor: Option<usize>,
     current: usize,
     mode: ViewMode,
-    textures: HashMap<TextureKey, TextureHandle>,
-    texture_last_used: HashMap<TextureKey, u64>,
+    textures: HashMap<PathBuf, Vec<TextureEntry>>,
+    texture_bytes: usize,
     texture_clock: u64,
+    failed_textures: HashSet<TextureKey>,
+    photos_version: u64,
+    photo_index: HashMap<PathBuf, usize>,
+    photo_index_version: u64,
+    dates_version: u64,
+    grid_layout: Option<GridLayout>,
+    grid_window: (usize, usize),
+    grid_last_offset: f32,
+    grid_scroll_down: bool,
+    grid_prefetch_at: std::time::Instant,
+    datetime_receiver: Receiver<DatetimeBatch>,
+    datetime_sender: Sender<DatetimeBatch>,
+    datetime_scan: Option<Arc<DatetimeScan>>,
     history: Vec<HistoryEntry>,
     notice: String,
     zoom: f32,
@@ -206,8 +279,8 @@ struct SorterApp {
     pending_source_info: HashSet<PathBuf>,
     pending_exif: HashSet<PathBuf>,
     scan_generation: usize,
-    texture_receiver: Receiver<(TextureKey, TextureKey, Option<ColorImage>)>,
-    queued_textures: HashSet<TextureKey>,
+    texture_receiver: Receiver<(TextureKey, TextureKey, PreviewOutcome)>,
+    queued_textures: HashMap<TextureKey, u8>,
     preview_pool: Arc<PreviewPool>,
     operation_sender: Sender<OperationMessage>,
     operation_receiver: Receiver<OperationMessage>,
@@ -242,6 +315,7 @@ impl Default for SorterApp {
         let (source_info_sender, source_info_receiver) = mpsc::channel();
         let (keep_scan_sender, keep_scan_receiver) = mpsc::channel();
         let (texture_sender, texture_receiver) = mpsc::channel();
+        let (datetime_sender, datetime_receiver) = mpsc::channel();
         let (operation_sender, operation_receiver) = mpsc::channel();
         let preview_pool = Arc::new(PreviewPool {
             queue: std::sync::Mutex::new(PreviewQueue::default()),
@@ -278,8 +352,21 @@ impl Default for SorterApp {
             current: 0,
             mode: ViewMode::Grid,
             textures: HashMap::new(),
-            texture_last_used: HashMap::new(),
+            texture_bytes: 0,
             texture_clock: 0,
+            failed_textures: HashSet::new(),
+            photos_version: 0,
+            photo_index: HashMap::new(),
+            photo_index_version: 0,
+            dates_version: 0,
+            grid_layout: None,
+            grid_window: (usize::MAX, usize::MAX),
+            grid_last_offset: 0.0,
+            grid_scroll_down: true,
+            grid_prefetch_at: std::time::Instant::now(),
+            datetime_receiver,
+            datetime_sender,
+            datetime_scan: None,
             history: Vec::new(),
             notice: "Choose a folder to begin.".into(),
             zoom: 1.0,
@@ -295,7 +382,7 @@ impl Default for SorterApp {
             pending_exif: HashSet::new(),
             scan_generation: 0,
             texture_receiver,
-            queued_textures: HashSet::new(),
+            queued_textures: HashMap::new(),
             preview_pool,
             operation_sender,
             operation_receiver,
@@ -431,7 +518,151 @@ fn load_full(path: &Path) -> Option<Arc<Vec<u8>>> {
     Some(value.data)
 }
 
+fn is_rw2(path: &Path) -> bool {
+    extension(path) == "rw2"
+}
+
+fn is_raw(path: &Path) -> bool {
+    RAW_EXTENSIONS.contains(&extension(path).as_str())
+}
+
+/// Full-resolution RAW decoding (demosaic, white balance, colour matrix, sRGB curve) is memory
+/// hungry (about 0.5 GB for a 16 MP image): allow only a couple at a time.
+const MAX_RAW_DECODES: usize = 2;
+static RAW_SLOTS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+/// Largest side handed to the GPU (typical OpenGL limit is 16384, older drivers 8192).
+const MAX_RAW_SIDE: usize = 8192;
+
+struct RawSlot;
+
+impl RawSlot {
+    fn acquire() -> Option<Self> {
+        let (lock, condvar) = &RAW_SLOTS;
+        let mut running = lock.lock().ok()?;
+        while *running >= MAX_RAW_DECODES {
+            running = condvar.wait(running).ok()?;
+        }
+        *running += 1;
+        Some(Self)
+    }
+}
+
+impl Drop for RawSlot {
+    fn drop(&mut self) {
+        let (lock, condvar) = &RAW_SLOTS;
+        if let Ok(mut running) = lock.lock() {
+            *running = running.saturating_sub(1);
+        }
+        condvar.notify_one();
+    }
+}
+
+/// Size of the developed RAW image (sensor area after the camera's crop), oriented like the
+/// preview. Cheap: no demosaicing, but the whole file is read.
+fn raw_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let raw = rawloader::decode_dummy(&mut fs::File::open(path).ok()?).ok()?;
+    let width = raw.width.checked_sub(raw.crops[1] + raw.crops[3])?;
+    let height = raw.height.checked_sub(raw.crops[0] + raw.crops[2])?;
+    let (width, height) = (width as u32, height as u32);
+    let (transpose, _, _) = raw.orientation.to_flips();
+    Some(if transpose { (height, width) } else { (width, height) })
+}
+
+/// Develops the RAW file itself at (at most) `size`, to show real sensor detail when zooming.
+fn decode_raw(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
+    let _slot = RawSlot::acquire()?;
+    let developed = std::panic::catch_unwind(|| {
+        let mut pipeline = imagepipe::Pipeline::new_from_file(path).ok()?;
+        pipeline.globals.settings.maxwidth = (size.0 as usize).min(MAX_RAW_SIDE);
+        pipeline.globals.settings.maxheight = (size.1 as usize).min(MAX_RAW_SIDE);
+        pipeline.output_8bit(None).ok()
+    })
+    .ok()??;
+    let (width, height) = (developed.width, developed.height);
+    if width.checked_mul(height)?.checked_mul(4)? > MAX_TEXTURE_BYTES
+        || developed.data.len() != width * height * 3
+    {
+        return None;
+    }
+    Some(ColorImage::from_rgb([width, height], &developed.data))
+}
+
+/// The embedded JPEG is quick and carries the camera's own look; the RAW is only developed
+/// when more pixels than the preview holds are asked for (zooming).
+fn rw2_needs_raw(embedded: (u32, u32), requested: (u32, u32)) -> bool {
+    requested.0 > embedded.0 || requested.1 > embedded.1
+}
+
+fn is_rw2_data(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"II\x55\x00")
+}
+
+/// Location of the embedded full-size JPEG preview of a Panasonic RW2 (IFD0 tag 0x2E) and the
+/// orientation (tag 0x112), read from the start of the file. RW2 is TIFF-like with the magic
+/// number 0x55 instead of 0x2A, which TIFF/EXIF readers reject.
+fn rw2_locate(head: &[u8]) -> Option<(usize, usize, u32)> {
+    if !is_rw2_data(head) {
+        return None;
+    }
+    let u16_at = |offset: usize| {
+        head.get(offset..offset.checked_add(2)?)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let u32_at = |offset: usize| {
+        head.get(offset..offset.checked_add(4)?)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let ifd = u32_at(4)? as usize;
+    let count = u16_at(ifd)? as usize;
+    let mut jpeg = None;
+    let mut orientation = 1;
+    for index in 0..count {
+        let entry = ifd + 2 + index * 12;
+        match u16_at(entry)? {
+            0x2e => jpeg = Some((u32_at(entry + 8)? as usize, u32_at(entry + 4)? as usize)),
+            0x112 => orientation = u16_at(entry + 8)? as u32,
+            _ => {}
+        }
+    }
+    let (offset, length) = jpeg?;
+    let orientation = if (1..=8).contains(&orientation) {
+        orientation
+    } else {
+        1
+    };
+    Some((offset, length, orientation))
+}
+
+/// Embedded JPEG preview of an RW2 and its orientation. Only the needed byte range is read,
+/// not the whole (about 20 MB) raw file.
+fn rw2_embedded_jpeg(path: &Path) -> Option<(Vec<u8>, u32)> {
+    const MAX_PREVIEW_BYTES: usize = 64 * 1024 * 1024;
+    let prefix = load_prefix(path)?;
+    let (offset, length, orientation) = rw2_locate(&prefix.data)?;
+    if length < 4 || length > MAX_PREVIEW_BYTES {
+        return None;
+    }
+    let end = offset.checked_add(length)?;
+    let jpeg = if end <= prefix.data.len() {
+        prefix.data[offset..end].to_vec()
+    } else {
+        use std::io::{Seek, SeekFrom};
+        let mut file = fs::File::open(path).ok()?;
+        file.seek(SeekFrom::Start(offset as u64)).ok()?;
+        let mut data = Vec::with_capacity(length);
+        file.take(length as u64).read_to_end(&mut data).ok()?;
+        data
+    };
+    (jpeg.len() == length && jpeg.starts_with(&[0xff, 0xd8])).then_some((jpeg, orientation))
+}
+
 fn parse_exif(bytes: &[u8]) -> Option<exif::Exif> {
+    if is_rw2_data(bytes) {
+        let mut tiff = bytes.to_vec();
+        tiff[2] = 0x2a;
+        return exif::Reader::new().read_raw(tiff).ok();
+    }
     exif::Reader::new()
         .read_from_container(&mut std::io::Cursor::new(bytes))
         .ok()
@@ -446,12 +677,16 @@ fn orientation_of(exif: Option<&exif::Exif>) -> u32 {
     .unwrap_or(1)
 }
 
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut decoder = JpegDecoder::new(std::io::Cursor::new(bytes));
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    Some((info.width as u32, info.height as u32))
+}
+
 fn image_dimensions(path: &Path, bytes: &[u8]) -> Option<(u32, u32)> {
     if is_jpeg(path) {
-        let mut decoder = JpegDecoder::new(std::io::Cursor::new(bytes));
-        decoder.read_info().ok()?;
-        let info = decoder.info()?;
-        Some((info.width as u32, info.height as u32))
+        jpeg_dimensions(bytes)
     } else {
         let reader = ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
@@ -738,6 +973,32 @@ fn read_exif(path: &Path) -> Vec<(exif::Tag, String, String)> {
         .collect()
 }
 
+/// Capture date of a photo, read from the first bytes of the file only (no full EXIF dump and
+/// no shared cache pollution), so thousands of photos can be dated quickly in the background.
+fn read_datetime(path: &Path) -> Option<String> {
+    let find = |exif: &exif::Exif| {
+        [
+            exif::Tag::DateTimeOriginal,
+            exif::Tag::DateTimeDigitized,
+            exif::Tag::DateTime,
+        ]
+        .iter()
+        .find_map(|tag| exif.get_field(*tag, exif::In::PRIMARY))
+        .map(|field| field.display_value().to_string())
+    };
+    if is_jpeg(path) {
+        let mut data = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(128 * 1024)
+            .read_to_end(&mut data)
+            .ok()?;
+        parse_exif(&data).as_ref().and_then(find)
+    } else {
+        exif_datetime(&read_exif(path))
+    }
+}
+
 fn photo_date(photo: &Photo) -> Option<&str> {
     let date = photo.datetime.as_deref()?.get(..10)?;
     let bytes = date.as_bytes();
@@ -953,6 +1214,16 @@ fn texture_fingerprint(path: &Path) -> u64 {
 }
 
 fn viewer_decode_size(path: &Path) -> Option<(u32, u32)> {
+    if is_raw(path) {
+        if let Some(size) = raw_dimensions(path) {
+            return Some(size);
+        }
+        if is_rw2(path) {
+            let (jpeg, orientation) = rw2_embedded_jpeg(path)?;
+            return Some(oriented_dimensions(jpeg_dimensions(&jpeg)?, orientation));
+        }
+        return None;
+    }
     let prefix = load_prefix(path)?;
     let mut data = prefix.data.clone();
     let mut dimensions = image_dimensions(path, &data);
@@ -1126,25 +1397,24 @@ fn enqueue_preview(
     let Ok(mut queue) = pool.queue.lock() else {
         return false;
     };
-    if queue.active.contains(key) {
-        return false;
-    }
-    if let Some(index) = queue.jobs.iter().position(|job| job.key == *key) {
-        queue.jobs[index].priority = queue.jobs[index].priority.max(priority);
-        queue.jobs[index].repaint = repaint;
-        queue.jobs[index].deadline = std::time::Instant::now() + job_timeout(priority);
-        queue
-            .jobs
-            .sort_by(|left, right| right.priority.cmp(&left.priority));
-        drop(queue);
-        pool.ready.notify_one();
+    if let Some(job) = queue.jobs.iter_mut().find(|job| job.key == *key) {
+        // Already waiting: only promote it (a thumbnail that scrolled into view).
+        if priority > job.priority {
+            job.priority = priority;
+        }
+        job.repaint = repaint;
+        job.deadline = std::time::Instant::now() + job_timeout(job.priority);
         return true;
+    }
+    if queue.active.contains(key) {
+        // A worker is already decoding it.
+        return false;
     }
     if priority >= 90 {
         let mut index = 0;
         while index < queue.jobs.len() {
             if queue.jobs[index].priority >= 90 && queue.jobs[index].key.path != key.path {
-                let removed = queue.jobs.remove(index);
+                let removed = queue.jobs.swap_remove(index);
                 queue.active.remove(&removed.key);
             } else {
                 index += 1;
@@ -1152,21 +1422,18 @@ fn enqueue_preview(
         }
     }
     if queue.jobs.len() >= MAX_PREVIEW_QUEUE {
-        if let Some(lowest) = queue
+        let lowest = queue
             .jobs
             .iter()
             .enumerate()
             .min_by_key(|(_, job)| job.priority)
-            .map(|(index, job)| (index, job.priority))
-        {
-            if lowest.1 < priority || priority >= 90 {
-                let removed = queue.jobs.remove(lowest.0);
+            .map(|(index, job)| (index, job.priority));
+        match lowest {
+            Some((index, lowest)) if lowest < priority || priority >= 90 => {
+                let removed = queue.jobs.swap_remove(index);
                 queue.active.remove(&removed.key);
-            } else {
-                return false;
             }
-        } else {
-            return false;
+            _ => return false,
         }
     }
     queue.active.insert(key.clone());
@@ -1177,17 +1444,25 @@ fn enqueue_preview(
         repaint,
         deadline: std::time::Instant::now() + job_timeout(priority),
     });
-    queue
-        .jobs
-        .sort_by(|left, right| right.priority.cmp(&left.priority));
     drop(queue);
     pool.ready.notify_one();
     true
 }
 
+/// Removes and returns the most urgent job; equally urgent jobs run in request order.
+fn take_best_job(jobs: &mut Vec<PreviewJob>) -> Option<PreviewJob> {
+    let mut best: Option<usize> = None;
+    for (index, job) in jobs.iter().enumerate() {
+        if best.is_none_or(|current| job.priority > jobs[current].priority) {
+            best = Some(index);
+        }
+    }
+    best.map(|index| jobs.remove(index))
+}
+
 fn preview_worker(
     pool: Arc<PreviewPool>,
-    sender: Sender<(TextureKey, TextureKey, Option<ColorImage>)>,
+    sender: Sender<(TextureKey, TextureKey, PreviewOutcome)>,
     cache: PathBuf,
 ) {
     loop {
@@ -1195,20 +1470,22 @@ fn preview_worker(
             let Ok(mut queue) = pool.queue.lock() else {
                 return;
             };
-            while queue.jobs.is_empty() {
+            loop {
+                if let Some(job) = take_best_job(&mut queue.jobs) {
+                    break job;
+                }
                 let Ok(next) = pool.ready.wait(queue) else {
                     return;
                 };
                 queue = next;
             }
-            queue.jobs.remove(0)
         };
         let actual_key = TextureKey {
             fingerprint: texture_fingerprint(&job.key.path),
             ..job.key.clone()
         };
-        let image = if job.deadline <= std::time::Instant::now() {
-            None
+        let outcome = if job.deadline <= std::time::Instant::now() {
+            PreviewOutcome::Expired
         } else {
             let cacheable = job.size == VIEW_PREVIEW;
             let cached = if cacheable {
@@ -1216,18 +1493,19 @@ fn preview_worker(
             } else {
                 None
             };
-            cached.or_else(|| {
+            let image = cached.or_else(|| {
                 let image = decode_preview(&job.key.path, job.size)?;
-                if job.deadline <= std::time::Instant::now() {
-                    return None;
-                }
                 if cacheable {
                     write_cached_preview(&cache, &actual_key, &image, &pool);
                 }
                 Some(image)
-            })
+            });
+            match image {
+                Some(image) => PreviewOutcome::Ready(image),
+                None => PreviewOutcome::Failed,
+            }
         };
-        if sender.send((job.key.clone(), actual_key, image)).is_err() {
+        if sender.send((job.key.clone(), actual_key, outcome)).is_err() {
             return;
         }
         job.repaint.request_repaint();
@@ -1362,7 +1640,76 @@ fn quick_preview(
     embedded_thumbnail(exif?, orientation)
 }
 
+/// Decodes JPEG bytes at (at most) `size`, applying the orientation. A thumbnail request
+/// (`VIEW_PREVIEW`) is decoded straight to thumbnail size using the JPEG's DCT scaling.
+fn decode_jpeg_bytes(data: &[u8], orientation: u32, size: (u32, u32)) -> Option<image::DynamicImage> {
+    let thumbnail = size == VIEW_PREVIEW;
+    let requested = if thumbnail {
+        if matches!(orientation, 5..=8) {
+            (size.1, size.0)
+        } else {
+            size
+        }
+    } else {
+        jpeg_dimensions(data)
+            .map(|source| oriented_dimensions(source, orientation))
+            .map_or(size, |source| (size.0.min(source.0), size.1.min(source.1)))
+    };
+    let decode_target = if matches!(orientation, 5..=8) {
+        (requested.1, requested.0)
+    } else {
+        requested
+    };
+    let image = apply_exif_orientation(
+        decode_jpeg(std::io::Cursor::new(data), Some(decode_target))?,
+        orientation,
+    );
+    Some(if image.width() > requested.0 || image.height() > requested.1 {
+        image.thumbnail(requested.0, requested.1)
+    } else {
+        image
+    })
+}
+
+fn color_image(decoded: image::DynamicImage) -> Option<ColorImage> {
+    let width = decoded.width() as usize;
+    let height = decoded.height() as usize;
+    if width.checked_mul(height)?.checked_mul(4)? > MAX_TEXTURE_BYTES {
+        return None;
+    }
+    let rgba = decoded.to_rgba8();
+    Some(ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        rgba.as_raw(),
+    ))
+}
+
 fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
+    if is_raw(path) && !is_rw2(path) {
+        // Other RAW formats have no embedded-preview reader here: reuse the system thumbnail
+        // for grid cells when there is one, otherwise develop the RAW at the requested size.
+        if size == VIEW_PREVIEW {
+            if let Some(thumbnail) = system_thumbnail(path) {
+                return Some(thumbnail);
+            }
+        }
+        return decode_raw(path, size);
+    }
+    if is_rw2(path) {
+        let embedded = rw2_embedded_jpeg(path);
+        if size != VIEW_PREVIEW {
+            let preview_size = embedded.as_ref().and_then(|(jpeg, orientation)| {
+                jpeg_dimensions(jpeg).map(|dimensions| oriented_dimensions(dimensions, *orientation))
+            });
+            if preview_size.is_none_or(|preview| rw2_needs_raw(preview, size)) {
+                if let Some(image) = decode_raw(path, size) {
+                    return Some(image);
+                }
+            }
+        }
+        let (jpeg, orientation) = embedded?;
+        return color_image(decode_jpeg_bytes(&jpeg, orientation, size)?);
+    }
     let prefix = if size == VIEW_PREVIEW {
         load_prefix(path)?
     } else {
@@ -1476,10 +1823,10 @@ fn is_kept(photo: &Photo, root: &Path, keep_folder: &Path, keep_files: &HashSet<
     };
     let kept_path = keep_folder.join(relative);
     let equivalent = |left: &Path, right: &Path| {
-        fs::canonicalize(left)
-            .ok()
-            .zip(fs::canonicalize(right).ok())
-            .is_some_and(|(left, right)| left == right)
+        let Ok(left) = fs::canonicalize(left) else {
+            return false;
+        };
+        fs::canonicalize(right).is_ok_and(|right| left == right)
     };
     keep_files.contains(&kept_path)
         || equivalent(&kept_path, &photo.display)
@@ -1548,6 +1895,7 @@ fn scan_folder(root: &Path) -> Vec<Photo> {
                 datetime: None,
                 exif: Vec::new(),
                 exif_loaded: false,
+                datetime_loaded: false,
                 kept: false,
             });
         }
@@ -1598,6 +1946,7 @@ impl SorterApp {
                 datetime: None,
                 exif: Vec::new(),
                 exif_loaded: true,
+                datetime_loaded: true,
                 kept: false,
             })
             .collect();
@@ -1690,40 +2039,25 @@ impl SorterApp {
             self.previous_folder = folder.parent().map(Path::to_path_buf);
             self.root = Some(folder.clone());
             self.photos.clear();
+            self.photos_changed();
             self.selection.clear();
             self.source_sizes.clear();
             self.texture_fingerprints.clear();
             self.pending_source_info.clear();
             self.pending_exif.clear();
             bytes_cache_clear();
-            self.textures.clear();
-
-            self.texture_last_used.clear();
-            self.queued_textures.clear();
+            self.clear_textures();
+            self.cancel_datetime_scan();
             self.current = 0;
             self.mode = ViewMode::Grid;
             self.scan_generation = self.scan_generation.wrapping_add(1);
             let generation = self.scan_generation;
             let folder_label = folder.display().to_string();
             let sender = self.scan_sender.clone();
-            let exif_sender = self.exif_sender.clone();
             let repaint = ctx.clone();
             thread::spawn(move || {
                 let photos = scan_folder(&folder);
-                let exif_paths: Vec<_> = photos.iter().map(|photo| photo.display.clone()).collect();
                 let _ = sender.send((generation, folder, photos));
-                repaint.request_repaint();
-                let mut last_repaint = std::time::Instant::now();
-                for path in exif_paths {
-                    let fields = read_exif(&path);
-                    if exif_sender.send((generation, path, fields)).is_err() {
-                        break;
-                    }
-                    if last_repaint.elapsed() >= std::time::Duration::from_millis(400) {
-                        repaint.request_repaint();
-                        last_repaint = std::time::Instant::now();
-                    }
-                }
                 repaint.request_repaint();
             });
             self.notice = format!("Scanning {folder_label}…");
@@ -1731,14 +2065,92 @@ impl SorterApp {
         }
     }
 
-    fn poll_scan(&mut self, ctx: &egui::Context) {
-        while let Ok((path, size, fingerprint)) = self.source_info_receiver.try_recv() {
-            self.pending_source_info.remove(&path);
-            if self.photos.iter().any(|photo| photo.display == path) {
-                self.source_sizes.insert(path.clone(), size);
-                self.texture_fingerprints.insert(path, fingerprint);
-            }
+    fn photos_changed(&mut self) {
+        self.photos_version = self.photos_version.wrapping_add(1);
+    }
+
+    fn ensure_photo_index(&mut self) {
+        if self.photo_index_version == self.photos_version && self.photo_index.len() == self.photos.len() {
+            return;
         }
+        self.photo_index = self
+            .photos
+            .iter()
+            .enumerate()
+            .map(|(index, photo)| (photo.display.clone(), index))
+            .collect();
+        self.photo_index_version = self.photos_version;
+    }
+
+    fn cancel_datetime_scan(&mut self) {
+        if let Some(scan) = self.datetime_scan.take() {
+            scan.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn start_datetime_scan(&mut self, ctx: &egui::Context) {
+        self.cancel_datetime_scan();
+        let mut background: Vec<PathBuf> = self
+            .photos
+            .iter()
+            .filter(|photo| !photo.datetime_loaded)
+            .map(|photo| photo.display.clone())
+            .collect();
+        background.reverse();
+        if background.is_empty() {
+            return;
+        }
+        let scan = Arc::new(DatetimeScan {
+            state: std::sync::Mutex::new(DatetimeState {
+                urgent: Vec::new(),
+                background,
+                taken: HashSet::new(),
+            }),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        for _ in 0..DATETIME_WORKERS {
+            let scan = Arc::clone(&scan);
+            let sender = self.datetime_sender.clone();
+            let repaint = ctx.clone();
+            let generation = self.scan_generation;
+            thread::spawn(move || {
+                let mut batch = Vec::new();
+                let mut last_flush = std::time::Instant::now();
+                while !scan.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    let Some(path) = scan.next() else { break };
+                    let datetime = read_datetime(&path);
+                    batch.push((path, datetime));
+                    if batch.len() >= 64
+                        || last_flush.elapsed() >= std::time::Duration::from_millis(150)
+                    {
+                        if sender
+                            .send((generation, std::mem::take(&mut batch)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        repaint.request_repaint();
+                        last_flush = std::time::Instant::now();
+                    }
+                }
+                if !batch.is_empty() {
+                    let _ = sender.send((generation, batch));
+                    repaint.request_repaint();
+                }
+            });
+        }
+        self.datetime_scan = Some(scan);
+    }
+
+    /// Dates the given photos before the rest of the folder (those around the viewport).
+    fn prioritize_datetimes(&self, paths: Vec<PathBuf>) {
+        if let Some(scan) = &self.datetime_scan {
+            scan.prioritize(paths);
+        }
+    }
+
+    fn poll_scan(&mut self, ctx: &egui::Context) {
         let mut latest = None;
         while let Ok(result) = self.scan_receiver.try_recv() {
             latest = Some(result);
@@ -1747,90 +2159,204 @@ impl SorterApp {
             if generation == self.scan_generation && self.root.as_ref() == Some(&folder) {
                 self.notice = format!("{} images found in {}", photos.len(), folder.display());
                 self.photos = photos;
+                self.photos_changed();
                 self.refresh_kept_status(ctx);
-                self.textures.clear();
+                self.clear_textures();
                 self.source_sizes.clear();
                 self.texture_fingerprints.clear();
                 self.pending_source_info.clear();
                 self.pending_exif.clear();
-
-                self.texture_last_used.clear();
-                self.queued_textures.clear();
                 self.selection.clear();
                 self.current = 0;
+                self.dates_version = self.dates_version.wrapping_add(1);
+                self.start_datetime_scan(ctx);
             }
         } else if self.root.is_some() && self.notice.starts_with("Scanning ") {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let mut updates = Vec::new();
-        while let Ok(update) = self.exif_receiver.try_recv() {
-            updates.push(update);
+        let mut source_infos = Vec::new();
+        while let Ok(info) = self.source_info_receiver.try_recv() {
+            source_infos.push(info);
         }
-        if !updates.is_empty() {
-            let positions: HashMap<PathBuf, usize> = self
-                .photos
-                .iter()
-                .enumerate()
-                .map(|(index, photo)| (photo.display.clone(), index))
-                .collect();
-            for (generation, path, fields) in updates {
-                self.pending_exif.remove(&path);
-                if generation != self.scan_generation {
-                    continue;
-                }
-                if let Some(photo) = positions
+        let mut datetimes = Vec::new();
+        while let Ok(batch) = self.datetime_receiver.try_recv() {
+            datetimes.push(batch);
+        }
+        let mut exif_updates = Vec::new();
+        while let Ok(update) = self.exif_receiver.try_recv() {
+            exif_updates.push(update);
+        }
+        if source_infos.is_empty() && datetimes.is_empty() && exif_updates.is_empty() {
+            return;
+        }
+        self.ensure_photo_index();
+        for (path, size, fingerprint) in source_infos {
+            self.pending_source_info.remove(&path);
+            if self.photo_index.contains_key(&path) {
+                self.source_sizes.insert(path.clone(), size);
+                self.texture_fingerprints.insert(path, fingerprint);
+            }
+        }
+        let mut dates_changed = false;
+        for (generation, batch) in datetimes {
+            if generation != self.scan_generation {
+                continue;
+            }
+            for (path, datetime) in batch {
+                if let Some(photo) = self
+                    .photo_index
                     .get(&path)
                     .and_then(|index| self.photos.get_mut(*index))
                 {
-                    photo.datetime = exif_datetime(&fields);
-                    photo.exif = fields;
-                    photo.exif_loaded = true;
+                    if !photo.datetime_loaded {
+                        photo.datetime_loaded = true;
+                        if datetime.is_some() {
+                            photo.datetime = datetime;
+                            dates_changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (generation, path, fields) in exif_updates {
+            self.pending_exif.remove(&path);
+            if generation != self.scan_generation {
+                continue;
+            }
+            if let Some(photo) = self
+                .photo_index
+                .get(&path)
+                .and_then(|index| self.photos.get_mut(*index))
+            {
+                photo.datetime = exif_datetime(&fields).or_else(|| photo.datetime.take());
+                photo.datetime_loaded = true;
+                photo.exif = fields;
+                photo.exif_loaded = true;
+                dates_changed = true;
+            }
+        }
+        if dates_changed {
+            self.dates_version = self.dates_version.wrapping_add(1);
+        }
+    }
+
+    fn clear_textures(&mut self) {
+        self.textures.clear();
+        self.texture_bytes = 0;
+        self.queued_textures.clear();
+        self.failed_textures.clear();
+    }
+
+    /// Frees the textures of photos that no longer exist (after a delete).
+    fn forget_missing_textures(&mut self, available: &HashSet<PathBuf>) {
+        self.textures.retain(|path, _| available.contains(path));
+        self.texture_bytes = self
+            .textures
+            .values()
+            .flatten()
+            .map(|entry| entry.bytes)
+            .sum();
+        self.queued_textures
+            .retain(|key, _| available.contains(&key.path));
+        self.failed_textures
+            .retain(|key| available.contains(&key.path));
+    }
+
+    fn touch_texture(&mut self, path: &Path, index: usize) {
+        self.texture_clock = self.texture_clock.wrapping_add(1);
+        if let Some(entry) = self
+            .textures
+            .get_mut(path)
+            .and_then(|entries| entries.get_mut(index))
+        {
+            entry.last_used = self.texture_clock;
+        }
+    }
+
+    fn evict_textures(&mut self) {
+        while self.texture_bytes > MAX_TEXTURE_MEMORY {
+            let oldest = self
+                .textures
+                .iter()
+                .flat_map(|(path, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, entry)| (entry.last_used, path, index))
+                })
+                .min_by_key(|(last_used, _, _)| *last_used)
+                .map(|(_, path, index)| (path.clone(), index));
+            let Some((path, index)) = oldest else {
+                self.texture_bytes = 0;
+                break;
+            };
+            if let Some(entries) = self.textures.get_mut(&path) {
+                let removed = entries.swap_remove(index);
+                self.texture_bytes = self.texture_bytes.saturating_sub(removed.bytes);
+                if entries.is_empty() {
+                    self.textures.remove(&path);
                 }
             }
         }
     }
 
     fn poll_textures(&mut self, ctx: &egui::Context) {
-        while let Ok((requested_key, key, image)) = self.texture_receiver.try_recv() {
-            if let Some(image) = image {
-                if self.photos.iter().any(|photo| photo.display == key.path) {
-                    self.texture_fingerprints
-                        .insert(key.path.clone(), key.fingerprint);
-                    let texture =
-                        ctx.load_texture(texture_name(&key), image, TextureOptions::LINEAR);
-                    self.textures.insert(key.clone(), texture);
-                    self.texture_clock = self.texture_clock.wrapping_add(1);
-                    self.texture_last_used
-                        .insert(key.clone(), self.texture_clock);
-                    while self.texture_memory_usage() > MAX_TEXTURE_MEMORY {
-                        let Some(oldest) = self
-                            .texture_last_used
-                            .iter()
-                            .min_by_key(|(_, last_used)| *last_used)
-                            .map(|(key, _)| key.clone())
-                        else {
-                            break;
-                        };
-                        self.textures.remove(&oldest);
-                        self.texture_last_used.remove(&oldest);
+        // Each texture costs a GPU upload: cap the number per frame and let the next frame
+        // continue, so scrolling stays smooth while thumbnails stream in.
+        let mut uploaded = 0usize;
+        let mut finished = Vec::new();
+        let mut pending_more = false;
+        while let Ok((requested_key, key, outcome)) = self.texture_receiver.try_recv() {
+            finished.push(requested_key.clone());
+            match outcome {
+                PreviewOutcome::Ready(image) => {
+                    self.ensure_photo_index();
+                    if self.photo_index.contains_key(&key.path) {
+                        self.texture_fingerprints
+                            .insert(key.path.clone(), key.fingerprint);
+                        let bytes = image.width().saturating_mul(image.height()).saturating_mul(4);
+                        let handle =
+                            ctx.load_texture(texture_name(&key), image, TextureOptions::LINEAR);
+                        self.texture_clock = self.texture_clock.wrapping_add(1);
+                        let entries = self.textures.entry(key.path.clone()).or_default();
+                        if let Some(old) = entries.iter().position(|entry| entry.key == key) {
+                            let removed = entries.swap_remove(old);
+                            self.texture_bytes = self.texture_bytes.saturating_sub(removed.bytes);
+                        }
+                        entries.push(TextureEntry {
+                            key,
+                            handle,
+                            bytes,
+                            last_used: self.texture_clock,
+                        });
+                        self.texture_bytes = self.texture_bytes.saturating_add(bytes);
+                        uploaded += 1;
                     }
                 }
+                PreviewOutcome::Failed => {
+                    self.failed_textures.insert(requested_key);
+                }
+                PreviewOutcome::Expired => {}
             }
-            self.queued_textures.remove(&requested_key);
-            if let Ok(mut queue) = self.preview_pool.queue.lock() {
-                queue.active.remove(&requested_key);
+            if uploaded >= MAX_UPLOADS_PER_FRAME {
+                pending_more = true;
+                break;
             }
         }
-    }
-
-    fn texture_memory_usage(&self) -> usize {
-        self.textures
-            .values()
-            .map(|texture| {
-                let [width, height] = texture.size();
-                width.saturating_mul(height).saturating_mul(4)
-            })
-            .sum()
+        if !finished.is_empty() {
+            for key in &finished {
+                self.queued_textures.remove(key);
+            }
+            if let Ok(mut queue) = self.preview_pool.queue.lock() {
+                for key in &finished {
+                    queue.active.remove(key);
+                }
+            }
+        }
+        self.evict_textures();
+        if pending_more {
+            ctx.request_repaint();
+        }
     }
 
     fn retain_prefetch(&mut self, wanted: &HashSet<PathBuf>) {
@@ -1858,17 +2384,27 @@ impl SorterApp {
         }
     }
 
-    fn retain_visible_thumbnails(&mut self, visible: &HashSet<PathBuf>) {
+    /// Cancels queued grid thumbnails of photos that are no longer near the viewport.
+    /// Thumbnails that were on screen but no longer are fall back to the neighbour priority.
+    fn retain_grid_thumbnails(&mut self, wanted: &HashSet<PathBuf>, visible: &HashSet<PathBuf>) {
+        let mut demoted = Vec::new();
         let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
             let mut removed = Vec::new();
             let mut retained = Vec::new();
-            for job in std::mem::take(&mut queue.jobs) {
+            for mut job in std::mem::take(&mut queue.jobs) {
                 let is_grid_thumbnail =
                     job.size == VIEW_PREVIEW && job.priority < PREFETCH_MIN_PRIORITY;
-                if is_grid_thumbnail && !visible.contains(&job.key.path) {
+                if is_grid_thumbnail && !wanted.contains(&job.key.path) {
                     queue.active.remove(&job.key);
                     removed.push(job.key);
                 } else {
+                    if is_grid_thumbnail
+                        && job.priority > GRID_NEAR_PRIORITY
+                        && !visible.contains(&job.key.path)
+                    {
+                        job.priority = GRID_NEAR_PRIORITY;
+                        demoted.push(job.key.clone());
+                    }
                     retained.push(job);
                 }
             }
@@ -1879,6 +2415,11 @@ impl SorterApp {
         };
         for key in removed {
             self.queued_textures.remove(&key);
+        }
+        for key in demoted {
+            if let Some(priority) = self.queued_textures.get_mut(&key) {
+                *priority = GRID_NEAR_PRIORITY;
+            }
         }
     }
 
@@ -1948,21 +2489,20 @@ impl SorterApp {
 
     fn texture(&mut self, ctx: &egui::Context, path: &Path, size: (u32, u32), priority: u8) {
         let key = self.cached_texture_key(path, size);
-        if let Some(existing) = self.textures.keys().find(|existing| {
-            existing.path == path
-                && existing.fingerprint == key.fingerprint
-                && existing.width >= key.width
-                && existing.height >= key.height
+        if let Some(index) = self.textures.get(path).and_then(|entries| {
+            entries.iter().position(|existing| {
+                existing.key.fingerprint == key.fingerprint
+                    && existing.key.width >= key.width
+                    && existing.key.height >= key.height
+            })
         }) {
-            let existing = existing.clone();
-            self.texture_clock = self.texture_clock.wrapping_add(1);
-            self.texture_last_used.insert(existing, self.texture_clock);
+            self.touch_texture(path, index);
             return;
         }
-        if self.textures.contains_key(&key) {
+        if self.failed_textures.contains(&key) {
             return;
         }
-        if self.queued_textures.contains(&key) {
+        if let Some(&queued_priority) = self.queued_textures.get(&key) {
             let still_active = self
                 .preview_pool
                 .queue
@@ -1970,19 +2510,32 @@ impl SorterApp {
                 .map(|queue| queue.active.contains(&key))
                 .unwrap_or(false);
             if still_active {
+                if priority > queued_priority
+                    && enqueue_preview(&self.preview_pool, &key, size, priority, ctx.clone())
+                {
+                    self.queued_textures.insert(key, priority);
+                }
                 return;
             }
             self.queued_textures.remove(&key);
         }
-        if size != VIEW_PREVIEW && priority >= ACTIVE_VIEW_IMAGE_PRIORITY {
-            if enqueue_preview(&self.preview_pool, &key, size, priority, ctx.clone()) {
-                self.queued_textures.insert(key);
-            }
-            return;
-        }
         if enqueue_preview(&self.preview_pool, &key, size, priority, ctx.clone()) {
-            self.queued_textures.insert(key);
+            self.queued_textures.insert(key, priority);
         }
+    }
+
+    /// Grid thumbnail: returns it when loaded, otherwise (re)requests it with `priority`.
+    fn grid_thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        priority: u8,
+    ) -> Option<TextureHandle> {
+        if let Some(texture) = self.viewer_texture(path, VIEW_PREVIEW) {
+            return Some(texture);
+        }
+        self.texture(ctx, path, VIEW_PREVIEW, priority);
+        None
     }
 
     fn source_size(&mut self, ctx: &egui::Context, path: &Path) -> (u32, u32) {
@@ -1994,22 +2547,23 @@ impl SorterApp {
     }
 
     fn viewer_texture(&mut self, path: &Path, target: (u32, u32)) -> Option<TextureHandle> {
-        let fingerprint = self.cached_texture_key(path, (0, 0)).fingerprint;
-        let best = self
-            .textures
+        let entries = self.textures.get(path)?;
+        let fingerprint = self
+            .texture_fingerprints
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| path_fingerprint(path));
+        let (index, handle) = entries
             .iter()
-            .filter(|(key, _)| key.path == path && key.fingerprint == fingerprint)
-            .min_by_key(|(key, _)| {
-                key.width.abs_diff(target.0) as u64 + key.height.abs_diff(target.1) as u64
+            .enumerate()
+            .filter(|(_, entry)| entry.key.fingerprint == fingerprint)
+            .min_by_key(|(_, entry)| {
+                entry.key.width.abs_diff(target.0) as u64
+                    + entry.key.height.abs_diff(target.1) as u64
             })
-            .map(|(key, texture)| (key.clone(), texture.clone()));
-        if let Some((key, texture)) = best {
-            self.texture_clock = self.texture_clock.wrapping_add(1);
-            self.texture_last_used.insert(key, self.texture_clock);
-            Some(texture)
-        } else {
-            None
-        }
+            .map(|(index, entry)| (index, entry.handle.clone()))?;
+        self.touch_texture(path, index);
+        Some(handle)
     }
 
     fn action_indices(&self) -> Vec<usize> {
@@ -2129,6 +2683,7 @@ impl SorterApp {
                         if result.kind == ActionKind::Delete && !result.restored_photos.is_empty() {
                             let restored = result.restored_photos;
                             self.photos.extend(restored.clone());
+                            self.photos_changed();
                             self.photos.sort_by(|left, right| {
                                 left.subfolder.cmp(&right.subfolder).then_with(|| {
                                     left.display.file_name().cmp(&right.display.file_name())
@@ -2209,6 +2764,7 @@ impl SorterApp {
                         } else {
                             self.photos
                                 .retain(|photo| !successful_photos.contains(&photo.display));
+                            self.photos_changed();
                         }
                         self.selection.clear();
                         let available: HashSet<_> = self
@@ -2216,11 +2772,7 @@ impl SorterApp {
                             .iter()
                             .map(|photo| photo.display.clone())
                             .collect();
-                        self.textures.retain(|key, _| available.contains(&key.path));
-                        self.texture_last_used
-                            .retain(|key, _| available.contains(&key.path));
-                        self.queued_textures
-                            .retain(|key| available.contains(&key.path));
+                        self.forget_missing_textures(&available);
                         if let Some(next) = self.action_next.take().or(current_display) {
                             if let Some(index) =
                                 self.photos.iter().position(|photo| photo.display == next)
@@ -2400,6 +2952,346 @@ impl SorterApp {
             "up" => key == Key::ArrowUp,
             "down" => key == Key::ArrowDown,
             _ => value.eq_ignore_ascii_case(&format!("{key:?}")),
+        }
+    }
+}
+
+impl SorterApp {
+    /// Paints only the rows that intersect the viewport and streams thumbnails in around it:
+    /// the cost of a frame depends on the screen size, not on the number of photos.
+    fn show_grid_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+    ) -> Option<(usize, Modifiers)> {
+        use egui::text::{LayoutJob, TextWrapping};
+        let mut clicked = None;
+        let spacing = ui.spacing().item_spacing;
+        let name_font = egui::TextStyle::Body.resolve(ui.style());
+        let date_font = egui::FontId::proportional(10.0);
+        let title_font = egui::FontId::proportional(20.0);
+        let range_font = egui::FontId::proportional(13.0);
+        let (name_height, date_height, title_height) = ui.fonts(|fonts| {
+            (
+                fonts.row_height(&name_font),
+                fonts.row_height(&date_font),
+                fonts.row_height(&title_font),
+            )
+        });
+        let text_color = ui.visuals().text_color();
+        let strong_color = ui.visuals().strong_text_color();
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        let show_filenames = self.settings.show_filenames;
+        let show_datetime = self.settings.show_datetime;
+        let root_name = self
+            .root
+            .as_ref()
+            .and_then(|root| root.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".into());
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                let width = ui.available_width();
+                let metrics = GridMetrics {
+                    width,
+                    gap_x: spacing.x,
+                    gap_y: spacing.y,
+                    name_height: name_height + 2.0,
+                    date_height: date_height + 2.0,
+                    header_height: 8.0 + title_height + spacing.y * 2.0 + 1.0,
+                };
+                let mut layout = match self.grid_layout.take() {
+                    Some(layout)
+                        if layout.matches(
+                            self.photos_version,
+                            &metrics,
+                            show_filenames,
+                            show_datetime,
+                        ) =>
+                    {
+                        layout
+                    }
+                    _ => {
+                        let groups = group_ranges(&self.photos, |photo| &photo.subfolder);
+                        GridLayout::build(
+                            &groups,
+                            self.photos.len(),
+                            self.photos_version,
+                            metrics,
+                            show_filenames,
+                            show_datetime,
+                        )
+                    }
+                };
+                self.grid_columns = layout.columns;
+                let origin = ui.cursor().min;
+                ui.allocate_exact_size(
+                    egui::vec2(width, layout.total_height),
+                    egui::Sense::hover(),
+                );
+                if viewport.min.y != self.grid_last_offset {
+                    self.grid_scroll_down = viewport.min.y > self.grid_last_offset;
+                    self.grid_last_offset = viewport.min.y;
+                }
+                if self.scroll_to_selection && self.selection.len() == 1 {
+                    if let Some(&index) = self.selection.iter().next() {
+                        if index < self.photos.len() {
+                            let item = layout.items[layout.photo_item[index] as usize];
+                            let inside = item.top >= viewport.min.y
+                                && item.top + item.height <= viewport.max.y;
+                            if !inside {
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(origin.x, origin.y + item.top),
+                                    egui::vec2(width, item.height),
+                                );
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                }
+                let visible = layout.visible_items(viewport.min.y, viewport.max.y);
+                for item_index in visible.clone() {
+                    let item = layout.items[item_index];
+                    let top = origin.y + item.top;
+                    if item.kind == GridItemKind::Header {
+                        let folder = &self.photos[item.start].subfolder;
+                        let title = if folder.as_os_str().is_empty() {
+                            root_name.clone()
+                        } else {
+                            folder.display().to_string()
+                        };
+                        let range = match layout.ranges.get(&item.start) {
+                            Some((version, label)) if *version == self.dates_version => {
+                                label.clone()
+                            }
+                            _ => {
+                                let label = date_range_label(&self.photos[item.start..item.end]);
+                                layout
+                                    .ranges
+                                    .insert(item.start, (self.dates_version, label.clone()));
+                                label
+                            }
+                        };
+                        let painter = ui.painter();
+                        let title_rect = painter.text(
+                            egui::pos2(origin.x, top + 8.0),
+                            egui::Align2::LEFT_TOP,
+                            title,
+                            title_font.clone(),
+                            strong_color,
+                        );
+                        if let Some(range) = range {
+                            painter.text(
+                                egui::pos2(title_rect.right() + 48.0, title_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                range,
+                                range_font.clone(),
+                                strong_color,
+                            );
+                        }
+                        let line_y = top + item.height - spacing.y - 0.5;
+                        painter.hline(origin.x..=origin.x + width, line_y, separator);
+                        continue;
+                    }
+                    for photo_index in item.start..item.end {
+                        let column = photo_index - item.start;
+                        let x = origin.x + column as f32 * (layout.cell_width + spacing.x);
+                        let cell_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, top),
+                            egui::vec2(layout.cell_width, layout.cell_height),
+                        );
+                        let thumb_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, top + layout.text_height),
+                            egui::vec2(layout.cell_width, layout.thumb_height),
+                        );
+                        let path = self.photos[photo_index].display.clone();
+                        let kept = self.photos[photo_index].kept;
+                        let texture = self.grid_thumbnail(ctx, &path, GRID_VISIBLE_PRIORITY);
+                        let selected = self.selection.contains(&photo_index);
+                        let mut text_top = top;
+                        let painter = ui.painter();
+                        if show_filenames {
+                            let kept_width = if kept {
+                                let galley = painter.layout_no_wrap(
+                                    "Kept".into(),
+                                    name_font.clone(),
+                                    text_color,
+                                );
+                                let kept_width = galley.size().x;
+                                painter.galley(
+                                    egui::pos2(cell_rect.right() - kept_width, text_top),
+                                    galley,
+                                    text_color,
+                                );
+                                kept_width + spacing.x
+                            } else {
+                                0.0
+                            };
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let mut job =
+                                LayoutJob::simple_singleline(name, name_font.clone(), text_color);
+                            job.wrap = TextWrapping::truncate_at_width(
+                                (layout.cell_width - kept_width).max(10.0),
+                            );
+                            let galley = painter.layout_job(job);
+                            painter.galley(egui::pos2(x, text_top), galley, text_color);
+                            text_top += metrics.name_height;
+                        }
+                        if show_datetime {
+                            let photo = &self.photos[photo_index];
+                            let label = match photo.datetime.as_deref() {
+                                Some(label) => label,
+                                None if photo.datetime_loaded => "No EXIF datetime",
+                                None => "…",
+                            };
+                            painter.text(
+                                egui::pos2(x, text_top),
+                                egui::Align2::LEFT_TOP,
+                                label,
+                                date_font.clone(),
+                                text_color,
+                            );
+                        }
+                        if let Some(texture) = texture {
+                            let image_size = texture.size_vec2();
+                            let fit = (thumb_rect.width() / image_size.x)
+                                .min(thumb_rect.height() / image_size.y);
+                            painter.image(
+                                texture.id(),
+                                egui::Rect::from_center_size(thumb_rect.center(), image_size * fit),
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            painter.rect_filled(thumb_rect, 2.0, egui::Color32::from_gray(48));
+                            let key = self.cached_texture_key(&path, VIEW_PREVIEW);
+                            if self.failed_textures.contains(&key) {
+                                ui.painter().text(
+                                    thumb_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Preview unavailable",
+                                    egui::FontId::default(),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                        if selected {
+                            ui.painter().rect_stroke(
+                                thumb_rect,
+                                2.0,
+                                egui::Stroke::new(3.0_f32, egui::Color32::LIGHT_BLUE),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        let id = ui.id().with(("grid_cell", photo_index));
+                        let mut response = ui.interact(cell_rect, id, egui::Sense::click());
+                        if kept {
+                            response = response.on_hover_text("Copied to keep folder");
+                        }
+                        if response.clicked() {
+                            clicked = Some((photo_index, ui.input(|input| input.modifiers)));
+                        }
+                        if response.double_clicked() {
+                            self.current = photo_index;
+                            self.mode = ViewMode::Viewer;
+                            self.last_viewer_image = None;
+                        }
+                    }
+                }
+                self.stream_grid_neighbours(ctx, &layout, visible, viewport.height());
+                self.grid_layout = Some(layout);
+            });
+        clicked
+    }
+
+    /// Loads what is around the viewport (more in the scrolling direction) and cancels what
+    /// is far away, so scrolling reveals thumbnails that are already there.
+    fn stream_grid_neighbours(
+        &mut self,
+        ctx: &egui::Context,
+        layout: &GridLayout,
+        visible: std::ops::Range<usize>,
+        viewport_height: f32,
+    ) {
+        if layout.items.is_empty() {
+            return;
+        }
+        let top = layout.items[visible.start.min(layout.items.len() - 1)].top;
+        let bottom = layout.items[visible.end.saturating_sub(1).min(layout.items.len() - 1)].top;
+        let (before, after) = if self.grid_scroll_down {
+            (1.0, 3.0)
+        } else {
+            (3.0, 1.0)
+        };
+        let near = layout.visible_items(
+            top - before * viewport_height,
+            bottom + after * viewport_height,
+        );
+        let window = (near.start, near.end);
+        if window == self.grid_window && self.grid_prefetch_at.elapsed() < GRID_PREFETCH_INTERVAL {
+            return;
+        }
+        let window_changed = window != self.grid_window;
+        self.grid_window = window;
+        self.grid_prefetch_at = std::time::Instant::now();
+        // Items ordered by usefulness: visible, then ahead of the scroll, then behind.
+        let ahead: Vec<usize> = if self.grid_scroll_down {
+            (visible.end..near.end).collect()
+        } else {
+            (near.start..visible.start).rev().collect()
+        };
+        let behind: Vec<usize> = if self.grid_scroll_down {
+            (near.start..visible.start).rev().collect()
+        } else {
+            (visible.end..near.end).collect()
+        };
+        let mut wanted: HashSet<PathBuf> = HashSet::new();
+        let mut on_screen: HashSet<PathBuf> = HashSet::new();
+        let mut dates: Vec<PathBuf> = Vec::new();
+        let mut requests: Vec<(PathBuf, u8)> = Vec::new();
+        let groups = [
+            (visible.clone().collect::<Vec<_>>(), GRID_VISIBLE_PRIORITY),
+            (ahead, GRID_NEAR_PRIORITY),
+            (behind, GRID_NEAR_PRIORITY - 10),
+        ];
+        'collect: for (items, priority) in groups {
+            for item_index in items {
+                let item = layout.items[item_index];
+                if item.kind != GridItemKind::Row {
+                    continue;
+                }
+                for photo in &self.photos[item.start..item.end] {
+                    if wanted.len() >= GRID_PREFETCH_LIMIT {
+                        break 'collect;
+                    }
+                    wanted.insert(photo.display.clone());
+                    if priority == GRID_VISIBLE_PRIORITY {
+                        on_screen.insert(photo.display.clone());
+                    }
+                    requests.push((photo.display.clone(), priority));
+                    if !photo.datetime_loaded {
+                        dates.push(photo.display.clone());
+                    }
+                }
+            }
+        }
+        if window_changed {
+            self.retain_grid_thumbnails(&wanted, &on_screen);
+        }
+        for (path, priority) in requests {
+            self.grid_thumbnail(ctx, &path, priority);
+        }
+        if !dates.is_empty() {
+            self.prioritize_datetimes(dates);
         }
     }
 }
@@ -2692,7 +3584,11 @@ impl eframe::App for SorterApp {
                                 );
                             }
                             if self.settings.show_datetime {
-                                ui.label(photo.datetime.as_deref().unwrap_or("No EXIF datetime"));
+                                ui.label(match photo.datetime.as_deref() {
+                                    Some(label) => label,
+                                    None if photo.datetime_loaded => "No EXIF datetime",
+                                    None => "…",
+                                });
                             }
                             if photo.kept {
                                 ui.label("Kept").on_hover_text(
@@ -2708,6 +3604,9 @@ impl eframe::App for SorterApp {
                 }
                 if self.settings.show_exif && !photo.exif_loaded {
                     self.request_exif(ctx, &photo.display, self.scan_generation);
+                }
+                if !photo.datetime_loaded {
+                    self.prioritize_datetimes(vec![photo.display.clone()]);
                 }
                 egui::TopBottomPanel::bottom("viewer_actions").show_inside(ui, |ui| {
                     ui.add_space(4.0);
@@ -2756,6 +3655,10 @@ impl eframe::App for SorterApp {
                     ui.allocate_exact_size(available, egui::Sense::click_and_drag());
                 if response.double_clicked() {
                     self.show_grid();
+                }
+                if response.middle_clicked() {
+                    self.zoom = 1.0;
+                    self.pan = Vec2::ZERO;
                 }
                 let scroll = if response.hovered() {
                     ctx.input(|input| input.raw_scroll_delta.y)
@@ -2844,7 +3747,7 @@ impl eframe::App for SorterApp {
                     ACTIVE_VIEW_PREVIEW_PRIORITY,
                 );
                 let texture = self.viewer_texture(&photo.display, requested_size);
-                let loading_image = self.queued_textures.iter().any(|key| {
+                let loading_image = self.queued_textures.keys().any(|key| {
                     key.path == photo.display
                         && key.width >= requested_size.0
                         && key.height >= requested_size.1
@@ -2901,16 +3804,7 @@ impl eframe::App for SorterApp {
                     }
                     return;
                 }
-                let mut index = 0;
-                let mut previous_folder: Option<PathBuf> = None;
                 let mut pending_selection = None;
-                let mut visible_thumbnails: HashSet<PathBuf> = HashSet::new();
-                let root_name = self
-                    .root
-                    .as_ref()
-                    .and_then(|root| root.file_name())
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| ".".into());
                 let available = ui.available_size();
                 let (grid_rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
                 ui.scope_builder(egui::UiBuilder::new().max_rect(grid_rect), |ui| {
@@ -2943,198 +3837,9 @@ impl eframe::App for SorterApp {
                                 }
                             });
                     }
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            while index < self.photos.len() {
-                                let folder = self.photos[index].subfolder.clone();
-                                if previous_folder.as_ref() != Some(&folder) {
-                                    ui.add_space(8.0);
-                                    let title = if folder.as_os_str().is_empty() {
-                                        root_name.clone()
-                                    } else {
-                                        folder.display().to_string()
-                                    };
-                                    let group_len = self.photos[index..]
-                                        .iter()
-                                        .take_while(|photo| photo.subfolder == folder)
-                                        .count();
-                                    let date_range =
-                                        date_range_label(&self.photos[index..index + group_len]);
-                                    let title_color = ui.visuals().strong_text_color();
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(title)
-                                                .strong()
-                                                .size(20.0)
-                                                .color(title_color),
-                                        );
-                                        if let Some(range) = date_range {
-                                            ui.add_space(48.0);
-                                            ui.label(
-                                                egui::RichText::new(range)
-                                                    .size(13.0)
-                                                    .color(title_color),
-                                            );
-                                        }
-                                    });
-                                    ui.separator();
-                                    previous_folder = Some(folder.clone());
-                                }
-                                ui.horizontal(|ui| {
-                                    let spacing = ui.spacing().item_spacing.x;
-                                    let total_width = ui.available_width();
-                                    let columns = ((total_width + spacing) / (160.0 + spacing))
-                                        .floor()
-                                        .max(1.0)
-                                        as usize;
-                                    self.grid_columns = columns;
-                                    let cell_width = ((total_width
-                                        - spacing * (columns - 1) as f32)
-                                        / columns as f32)
-                                        .max(100.0);
-                                    let stop = (index + columns).min(self.photos.len());
-                                    // Every thumbnail's long edge equals the cell width; the row
-                                    // height follows the tallest resulting thumbnail.
-                                    let row_end = (index..stop)
-                                        .find(|&i| self.photos[i].subfolder != folder)
-                                        .unwrap_or(stop);
-                                    let thumb_height = (index..row_end)
-                                        .map(|i| {
-                                            let path = self.photos[i].display.clone();
-                                            self.viewer_texture(&path, (320, 240))
-                                                .map(|texture| {
-                                                    let size = texture.size_vec2();
-                                                    cell_width * size.y / size.x.max(size.y).max(1.0)
-                                                })
-                                                .unwrap_or(cell_width * 0.75)
-                                        })
-                                        .fold(0.0_f32, f32::max)
-                                        .max(cell_width * 0.25);
-                                    while index < stop {
-                                        if self.photos[index].subfolder != folder {
-                                            break;
-                                        }
-                                        let photo = {
-                                            let source = &self.photos[index];
-                                            Photo {
-                                                display: source.display.clone(),
-                                                files: Vec::new(),
-                                                subfolder: PathBuf::new(),
-                                                datetime: source.datetime.clone(),
-                                                exif: Vec::new(),
-                                                exif_loaded: source.exif_loaded,
-                                                kept: source.kept,
-                                            }
-                                        };
-                                        let photo_index = index;
-                                        let selected = self.selection.contains(&index);
-                                        ui.vertical(|ui| {
-                                            ui.set_width(cell_width);
-                                            ui.horizontal_wrapped(|ui| {
-                                                if self.settings.show_filenames {
-                                                    ui.label(
-                                                        photo
-                                                            .display
-                                                            .file_name()
-                                                            .unwrap_or_default()
-                                                            .to_string_lossy(),
-                                                    );
-                                                }
-                                                if photo.kept {
-                                                    ui.label("Kept")
-                                                        .on_hover_text("Copied to keep folder");
-                                                }
-                                            });
-                                            if self.settings.show_datetime {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        photo
-                                                            .datetime
-                                                            .as_deref()
-                                                            .unwrap_or("No EXIF datetime"),
-                                                    )
-                                                    .size(10.0),
-                                                );
-                                            }
-                                            let size = Vec2::new(cell_width, thumb_height);
-                                            let (rect, response) =
-                                                ui.allocate_exact_size(size, egui::Sense::click());
-                                            let visible = ui.is_rect_visible(rect);
-                                            if visible {
-                                                visible_thumbnails.insert(photo.display.clone());
-                                                self.texture(ctx, &photo.display, (320, 240), 0);
-                                            }
-                                            if let Some(texture) =
-                                                self.viewer_texture(&photo.display, (320, 240))
-                                            {
-                                                let image_size = texture.size_vec2();
-                                                let fit = (rect.width() / image_size.x)
-                                                    .min(rect.height() / image_size.y);
-                                                let image_rect = egui::Rect::from_center_size(
-                                                    rect.center(),
-                                                    image_size * fit,
-                                                );
-                                                ui.painter().image(
-                                                    texture.id(),
-                                                    image_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            } else {
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    2.0,
-                                                    egui::Color32::DARK_GRAY,
-                                                );
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "Preview unavailable",
-                                                    egui::FontId::default(),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            }
-                                            if self.scroll_to_selection
-                                                && selected
-                                                && self.selection.len() == 1
-                                            {
-                                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                                            }
-                                            if selected {
-                                                ui.painter().rect_stroke(
-                                                    rect,
-                                                    2.0,
-                                                    egui::Stroke::new(
-                                                        3.0_f32,
-                                                        egui::Color32::LIGHT_BLUE,
-                                                    ),
-                                                    egui::StrokeKind::Inside,
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                pending_selection = Some((
-                                                    photo_index,
-                                                    response.ctx.input(|input| input.modifiers),
-                                                ));
-                                            }
-                                            if response.double_clicked() {
-                                                self.current = photo_index;
-                                                self.mode = ViewMode::Viewer;
-                                                self.last_viewer_image = None;
-                                            }
-                                        });
-                                        index += 1;
-                                    }
-                                });
-                            }
-                        });
+                    pending_selection = self.show_grid_rows(ui, ctx);
                 });
                 self.scroll_to_selection = false;
-                self.retain_visible_thumbnails(&visible_thumbnails);
                 if let Some((index, modifiers)) = pending_selection {
                     self.select(index, modifiers);
                 }
@@ -3224,6 +3929,7 @@ mod tests {
             datetime: None,
             exif: Vec::new(),
             exif_loaded: false,
+            datetime_loaded: false,
             kept: false,
         };
         let raw_copy = keep.join("trip/photo.ARW");
@@ -3250,6 +3956,7 @@ mod tests {
             datetime: datetime.map(str::to_owned),
             exif: Vec::new(),
             exif_loaded: false,
+            datetime_loaded: false,
             kept: false,
         };
         let same = [
@@ -3292,6 +3999,100 @@ mod tests {
             "Date, time and position"
         );
         assert_eq!(exif_category(exif::Tag::PixelXDimension), "Image");
+    }
+
+    #[test]
+    fn preview_queue_promotes_waiting_jobs_and_runs_most_urgent_first() {
+        let pool = PreviewPool {
+            queue: std::sync::Mutex::new(PreviewQueue::default()),
+            ready: std::sync::Condvar::new(),
+            cache_size: AtomicUsize::new(0),
+        };
+        let ctx = egui::Context::default();
+        let key = |name: &str| texture_key(Path::new(name), VIEW_PREVIEW);
+        assert!(enqueue_preview(&pool, &key("a"), VIEW_PREVIEW, 10, ctx.clone()));
+        assert!(enqueue_preview(&pool, &key("b"), VIEW_PREVIEW, 20, ctx.clone()));
+        assert!(enqueue_preview(&pool, &key("c"), VIEW_PREVIEW, 15, ctx.clone()));
+        // "a" scrolls into view: it must jump ahead instead of being ignored.
+        assert!(enqueue_preview(&pool, &key("a"), VIEW_PREVIEW, 50, ctx.clone()));
+        let mut queue = pool.queue.lock().unwrap();
+        assert_eq!(queue.jobs.len(), 3);
+        let order: Vec<_> = std::iter::from_fn(|| take_best_job(&mut queue.jobs))
+            .map(|job| job.key.path)
+            .collect();
+        assert_eq!(
+            order,
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
+    }
+
+    #[test]
+    fn datetime_scan_serves_urgent_photos_first_and_never_twice() {
+        let scan = DatetimeScan {
+            state: std::sync::Mutex::new(DatetimeState {
+                urgent: Vec::new(),
+                background: vec!["c".into(), "b".into(), "a".into()],
+                taken: HashSet::new(),
+            }),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        };
+        scan.prioritize(vec!["c".into(), "b".into()]);
+        assert_eq!(scan.next(), Some(PathBuf::from("c")));
+        assert_eq!(scan.next(), Some(PathBuf::from("b")));
+        assert_eq!(scan.next(), Some(PathBuf::from("a")));
+        assert_eq!(scan.next(), None);
+        scan.prioritize(vec!["a".into()]);
+        assert_eq!(scan.next(), None);
+    }
+
+    #[test]
+    fn rw2_without_jpeg_uses_embedded_preview_with_orientation() {
+        // Panasonic RW2: TIFF-like ("II" + 0x55), IFD0 tag 0x2E points at a full JPEG.
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 32, image::Rgb([200, 30, 30])))
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+        let jpeg_offset = 4096u32;
+        let mut file = vec![0u8; jpeg_offset as usize];
+        file[..4].copy_from_slice(b"II\x55\x00");
+        file[4..8].copy_from_slice(&24u32.to_le_bytes());
+        file[24..26].copy_from_slice(&2u16.to_le_bytes());
+        let entries = [
+            (0x2eu16, 7u16, jpeg.len() as u32, jpeg_offset),
+            (0x112, 3, 1, 6), // orientation: rotate 90 degrees
+        ];
+        for (index, (tag, kind, count, value)) in entries.iter().enumerate() {
+            let at = 26 + index * 12;
+            file[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            file[at + 2..at + 4].copy_from_slice(&kind.to_le_bytes());
+            file[at + 4..at + 8].copy_from_slice(&count.to_le_bytes());
+            file[at + 8..at + 12].copy_from_slice(&value.to_le_bytes());
+        }
+        file.extend_from_slice(&jpeg);
+        // Larger than the 256 KB head read, so the preview must be fetched by range.
+        file.resize(file.len() + 400 * 1024, 7);
+        let root = std::env::temp_dir().join(format!("image_sorter_rw2_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("P1.RW2");
+        fs::write(&path, &file).unwrap();
+        assert_eq!(rw2_locate(&file), Some((4096, jpeg.len(), 6)));
+        assert_eq!(rw2_locate(b"II*\x00"), None);
+        let thumbnail = decode_preview(&path, VIEW_PREVIEW).expect("RW2 thumbnail");
+        assert_eq!(thumbnail.size, [32, 64], "rotated by orientation 6");
+        assert_eq!(viewer_decode_size(&path), Some((32, 64)));
+        let full = decode_preview(&path, (1920, 1440)).expect("RW2 full preview");
+        assert_eq!(full.size, [32, 64]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raw_is_only_developed_when_zooming_past_the_embedded_preview() {
+        assert!(!rw2_needs_raw((1920, 1440), (1463, 1100)));
+        assert!(!rw2_needs_raw((1920, 1440), (1920, 1440)));
+        assert!(rw2_needs_raw((1920, 1440), (1921, 1440)));
+        assert!(rw2_needs_raw((1920, 1440), (4608, 3464)));
+        assert!(is_raw(Path::new("a.ARW")) && !is_raw(Path::new("a.jpg")));
     }
 
     #[test]
