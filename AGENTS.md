@@ -62,6 +62,12 @@ All requested features are implemented. Latest round (all done, `cargo check` an
 - Kept status: `scan_keep_folder` returns `KeepFiles` (file name -> sizes, suffixed copies also registered under the original name via `unsuffixed_name`); `is_kept(photo, &keep_files)` matches name + size of any of the photo's files.
 - Toolbar slider (grid mode only) sets `Settings.grid_cell_size` (80..=320, default 160, saved) -> `GridMetrics.min_cell`; 320 max because thumbnails are decoded at 320x240.
 
+## Operation completion
+- `poll_operations` no longer yanks the user back: `action_start` (current photo when the operation began) and `action_next` are compared with the photo being viewed on completion. If the user moved on, `current`, `mode` and the selection are kept (re-resolved by path via `photo_index`, since a delete shifts indices); otherwise it advances to `action_next` as before. `action_origin` was removed.
+
+## Grid scrolling
+- `show_grid_rows` multiplies `smooth_scroll_delta.y` by `ScrollBoost::factor` while the pointer is over the grid: `GRID_SCROLL_BASE` (3x) ramping to `GRID_SCROLL_MAX` (12x) over `GRID_SCROLL_RAMP` of continuous scrolling; resets after a `GRID_SCROLL_GAP` pause or a direction change.
+
 ## Known caveats / possible follow-ups
 - Photos without any EXIF data are re-read each frame while `show_exif` is on and `exif` is empty (cheap failure, but could be guarded with a "loaded" flag).
 - Optionally build a fuller tag ID -> name table from `EXIF Tags.html` if kamadak-exif names are insufficient (many MakerNote/unknown tags show as "Unknown EXIF tag 0xXXXX" and fall in "Others").

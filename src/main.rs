@@ -42,6 +42,46 @@ const ACTIVE_VIEW_IMAGE_PRIORITY: u8 = 240;
 const MAX_TEXTURE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PREVIEW_QUEUE: usize = 512;
 const MAX_HISTORY: usize = 100;
+/// Grid scrolling speed (1.0 = egui default): starts at `BASE` and ramps up to `MAX` while the
+/// user keeps scrolling (no pause longer than `GAP`, no change of direction) for `RAMP`.
+const GRID_SCROLL_BASE: f32 = 3.0;
+const GRID_SCROLL_MAX: f32 = 12.0;
+const GRID_SCROLL_RAMP: std::time::Duration = std::time::Duration::from_millis(1500);
+const GRID_SCROLL_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Scroll acceleration: the longer a scroll gesture lasts, the faster it gets.
+#[derive(Default)]
+struct ScrollBoost {
+    started: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    direction: f32,
+}
+
+impl ScrollBoost {
+    /// `raw_delta` is the wheel/touchpad input of this frame (non zero only on event frames).
+    fn factor(&mut self, now: std::time::Instant, raw_delta: f32) -> f32 {
+        if raw_delta != 0.0 {
+            let continuing = self
+                .last
+                .is_some_and(|last| now.duration_since(last) <= GRID_SCROLL_GAP)
+                && raw_delta.signum() == self.direction;
+            if !continuing {
+                self.started = Some(now);
+            }
+            self.direction = raw_delta.signum();
+            self.last = Some(now);
+        }
+        match (self.started, self.last) {
+            (Some(started), Some(last)) if now.duration_since(last) <= GRID_SCROLL_GAP => {
+                let progress = (last.duration_since(started).as_secs_f32()
+                    / GRID_SCROLL_RAMP.as_secs_f32())
+                .min(1.0);
+                GRID_SCROLL_BASE + (GRID_SCROLL_MAX - GRID_SCROLL_BASE) * progress
+            }
+            _ => GRID_SCROLL_BASE,
+        }
+    }
+}
 const GRID_VISIBLE_PRIORITY: u8 = 50;
 const GRID_NEAR_PRIORITY: u8 = 30;
 const DATETIME_WORKERS: usize = 3;
@@ -243,7 +283,7 @@ struct Settings {
     grid_cell_size: f32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
     Grid,
     Viewer,
@@ -304,7 +344,9 @@ struct SorterApp {
     operation_sender: Sender<OperationMessage>,
     operation_receiver: Receiver<OperationMessage>,
     operation_pending: bool,
-    action_origin: Option<ViewMode>,
+    /// Photo that was current when the running operation started, and the one to move to once
+    /// it finishes (only used if the user has not moved in the meantime).
+    action_start: Option<PathBuf>,
     action_next: Option<PathBuf>,
     last_viewer_image: Option<PathBuf>,
     scroll_to_selection: bool,
@@ -313,6 +355,7 @@ struct SorterApp {
     source_sizes: HashMap<PathBuf, (u32, u32)>,
     texture_fingerprints: HashMap<PathBuf, u64>,
     expanded_exif: HashSet<String>,
+    scroll_boost: ScrollBoost,
 }
 
 impl Default for SorterApp {
@@ -414,7 +457,7 @@ impl Default for SorterApp {
             operation_sender,
             operation_receiver,
             operation_pending: false,
-            action_origin: None,
+            action_start: None,
             action_next: None,
             last_viewer_image: None,
             scroll_to_selection: false,
@@ -423,6 +466,7 @@ impl Default for SorterApp {
             source_sizes: HashMap::new(),
             texture_fingerprints: HashMap::new(),
             expanded_exif: HashSet::new(),
+            scroll_boost: ScrollBoost::default(),
         }
     }
 }
@@ -2790,7 +2834,10 @@ impl SorterApp {
         let sender = self.operation_sender.clone();
         let progress_sender = sender.clone();
         self.operation_pending = true;
-        self.action_origin = Some(self.mode);
+        self.action_start = self
+            .photos
+            .get(self.current)
+            .map(|photo| photo.display.clone());
         self.action_next = self
             .photos
             .iter()
@@ -2914,10 +2961,23 @@ impl SorterApp {
                             .filter(|(_, files)| files.iter().all(|file| done.contains(file)))
                             .map(|(display, _)| display)
                             .collect();
+                        // The user may have moved on while the files were being processed: keep
+                        // what they are looking at, found again by path (a delete shifts indices).
                         let current_display = self
                             .photos
                             .get(self.current)
                             .map(|photo| photo.display.clone());
+                        let anchor_display = self
+                            .anchor
+                            .and_then(|index| self.photos.get(index))
+                            .map(|photo| photo.display.clone());
+                        let selected_displays: Vec<PathBuf> = self
+                            .selection
+                            .iter()
+                            .filter_map(|index| self.photos.get(*index))
+                            .map(|photo| photo.display.clone())
+                            .filter(|display| !successful_photos.contains(display))
+                            .collect();
                         if result.kind == ActionKind::Keep {
                             for photo in &mut self.photos {
                                 if successful_photos.contains(&photo.display) {
@@ -2929,37 +2989,42 @@ impl SorterApp {
                                 .retain(|photo| !successful_photos.contains(&photo.display));
                             self.photos_changed();
                         }
-                        self.selection.clear();
-                        self.anchor = None;
+                        self.ensure_photo_index();
+                        self.selection = selected_displays
+                            .iter()
+                            .filter_map(|display| self.photo_index.get(display).copied())
+                            .collect();
+                        self.anchor = anchor_display
+                            .and_then(|display| self.photo_index.get(&display).copied())
+                            .filter(|index| self.selection.contains(index));
                         let available: HashSet<_> = self
                             .photos
                             .iter()
                             .map(|photo| photo.display.clone())
                             .collect();
                         self.forget_missing_textures(&available);
-                        if let Some(next) = self.action_next.take().or(current_display) {
-                            if let Some(index) =
-                                self.photos.iter().position(|photo| photo.display == next)
-                            {
-                                self.current = index;
-                            } else {
-                                self.current =
-                                    self.current.min(self.photos.len().saturating_sub(1));
-                            }
+                        let start = self.action_start.take();
+                        let next = self.action_next.take();
+                        let moved_on = current_display != start;
+                        let target = if moved_on {
+                            current_display.clone()
                         } else {
-                            self.current = self.current.min(self.photos.len().saturating_sub(1));
-                        }
+                            next.clone()
+                        };
+                        let found = [target, current_display, next]
+                            .into_iter()
+                            .flatten()
+                            .find_map(|display| self.photo_index.get(&display).copied());
+                        self.current = found
+                            .unwrap_or_else(|| self.current.min(self.photos.len().saturating_sub(1)));
                         if self.photos.is_empty() {
                             self.mode = ViewMode::Grid;
                             self.current = 0;
-                        } else if self.action_origin == Some(ViewMode::Viewer) {
-                            self.mode = ViewMode::Viewer;
                         }
                     }
                     if result.kind == ActionKind::Keep || result.kind == ActionKind::Delete {
                         self.refresh_kept_status(ctx);
                     }
-                    self.action_origin = None;
                 }
             }
         }
@@ -2977,7 +3042,7 @@ impl SorterApp {
             return;
         };
         self.operation_pending = true;
-        self.action_origin = Some(self.mode);
+        self.action_start = None;
         self.action_next = None;
         self.notice = "Undoing last operation…".into();
         let sender = self.operation_sender.clone();
@@ -3213,6 +3278,12 @@ impl SorterApp {
             .and_then(|root| root.file_name())
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".into());
+        if ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
+            // The scroll area consumes this value: scaling it only speeds up the grid.
+            let raw = ui.input(|input| input.raw_scroll_delta.y);
+            let factor = self.scroll_boost.factor(std::time::Instant::now(), raw);
+            ui.input_mut(|input| input.smooth_scroll_delta.y *= factor);
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -4247,6 +4318,121 @@ mod tests {
         assert_eq!(fs::read(keep.join("img_1.rw2")).unwrap(), b"a");
         assert_eq!(fs::read(keep.join("img_2.jpg")).unwrap(), b"b");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn finished_operation(
+        kind: ActionKind,
+        photos: &[Photo],
+        done: &[usize],
+    ) -> OperationMessage {
+        let history = HistoryEntry {
+            kind,
+            files: Vec::new(),
+            photos: Vec::new(),
+            kept_before: HashSet::new(),
+        };
+        OperationMessage::Complete(OperationResult {
+            kind,
+            history,
+            completed: done.iter().map(|i| photos[*i].display.clone()).collect(),
+            photo_files: done
+                .iter()
+                .map(|i| (photos[*i].display.clone(), vec![photos[*i].display.clone()]))
+                .collect(),
+            errors: Vec::new(),
+            is_undo: false,
+            restored_photos: Vec::new(),
+        })
+    }
+
+    fn test_photo(name: &str) -> Photo {
+        Photo {
+            display: PathBuf::from(name),
+            files: vec![PathBuf::from(name)],
+            subfolder: PathBuf::new(),
+            datetime: None,
+            exif: Vec::new(),
+            exif_loaded: false,
+            datetime_loaded: false,
+            kept: false,
+        }
+    }
+
+    #[test]
+    fn finished_operation_does_not_pull_back_a_user_who_moved_on() {
+        let ctx = egui::Context::default();
+        let names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"];
+        let setup = |current: usize| {
+            let mut app = SorterApp::default();
+            app.photos = names.iter().map(|name| test_photo(name)).collect();
+            app.mode = ViewMode::Viewer;
+            app.current = current;
+            app
+        };
+        // Delete "a" started on photo 0, the user then browsed to "c" (index 2).
+        let mut app = setup(0);
+        app.operation_pending = true;
+        app.action_start = Some(PathBuf::from("a.jpg"));
+        app.action_next = Some(PathBuf::from("b.jpg"));
+        app.current = 2;
+        let message = finished_operation(ActionKind::Delete, &app.photos, &[0]);
+        app.operation_sender.send(message).unwrap();
+        app.poll_operations(&ctx);
+        assert_eq!(app.photos.len(), 3);
+        assert_eq!(app.photos[app.current].display, PathBuf::from("c.jpg"));
+        assert_eq!(app.mode, ViewMode::Viewer);
+
+        // Same operation, user stayed put: move on to the next photo as before.
+        let mut app = setup(0);
+        app.operation_pending = true;
+        app.action_start = Some(PathBuf::from("a.jpg"));
+        app.action_next = Some(PathBuf::from("b.jpg"));
+        let message = finished_operation(ActionKind::Delete, &app.photos, &[0]);
+        app.operation_sender.send(message).unwrap();
+        app.poll_operations(&ctx);
+        assert_eq!(app.photos[app.current].display, PathBuf::from("b.jpg"));
+
+        // Keep: the user went back to the grid meanwhile and must stay there, on "d".
+        let mut app = setup(0);
+        app.operation_pending = true;
+        app.action_start = Some(PathBuf::from("a.jpg"));
+        app.action_next = Some(PathBuf::from("b.jpg"));
+        app.mode = ViewMode::Grid;
+        app.current = 3;
+        app.selection = HashSet::from([3]);
+        let message = finished_operation(ActionKind::Keep, &app.photos, &[0]);
+        app.operation_sender.send(message).unwrap();
+        app.poll_operations(&ctx);
+        assert_eq!(app.mode, ViewMode::Grid);
+        assert_eq!(app.current, 3);
+        assert_eq!(app.selection, HashSet::from([3]));
+    }
+
+    #[test]
+    fn scroll_boost_ramps_up_while_scrolling_and_resets_after_a_pause_or_reversal() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let start = std::time::Instant::now();
+        let mut boost = ScrollBoost::default();
+        assert_eq!(boost.factor(start, 0.0), GRID_SCROLL_BASE);
+        assert_eq!(boost.factor(start, -10.0), GRID_SCROLL_BASE);
+        let mut previous = GRID_SCROLL_BASE;
+        for step in 1..=10 {
+            let factor = boost.factor(start + ms(step * 150), -10.0);
+            assert!(factor > previous || factor == GRID_SCROLL_MAX);
+            previous = factor;
+        }
+        assert_eq!(previous, GRID_SCROLL_MAX);
+        // Smoothing frames without a new event keep the speed for a moment, then it falls back.
+        assert_eq!(boost.factor(start + ms(1500 + 100), 0.0), GRID_SCROLL_MAX);
+        assert_eq!(boost.factor(start + ms(1500 + 400), 0.0), GRID_SCROLL_BASE);
+        // A new gesture after the pause starts slow again.
+        assert_eq!(boost.factor(start + ms(2500), -10.0), GRID_SCROLL_BASE);
+        // Reversing direction restarts the ramp.
+        boost.factor(start + ms(2600), -10.0);
+        boost.factor(start + ms(2900), -10.0);
+        assert!(boost.factor(start + ms(3000), -10.0) > GRID_SCROLL_BASE);
+        assert_eq!(boost.factor(start + ms(3100), 10.0), GRID_SCROLL_BASE);
     }
 
     #[test]
