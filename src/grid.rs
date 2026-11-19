@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-pub const GRID_MIN_CELL: f32 = 160.0;
+pub const GRID_MIN_CELL: f32 = 80.0;
+/// Thumbnails are decoded at 320x240: larger cells would only show upscaled pixels.
+pub const GRID_MAX_CELL: f32 = 320.0;
+pub const GRID_DEFAULT_CELL: f32 = 160.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridItemKind {
@@ -34,6 +37,8 @@ pub struct GridMetrics {
     pub name_height: f32,
     pub date_height: f32,
     pub header_height: f32,
+    /// Wanted minimum width of a cell: the slider of the toolbar.
+    pub min_cell: f32,
 }
 
 pub struct GridLayout {
@@ -71,6 +76,7 @@ impl GridLayout {
             && self.metrics.name_height == metrics.name_height
             && self.metrics.date_height == metrics.date_height
             && self.metrics.header_height == metrics.header_height
+            && self.metrics.min_cell == metrics.min_cell
     }
 
     /// `groups` are the `(start, end)` photo ranges of consecutive photos sharing a subfolder.
@@ -82,7 +88,7 @@ impl GridLayout {
         show_filenames: bool,
         show_datetime: bool,
     ) -> Self {
-        let columns = ((metrics.width + metrics.gap_x) / (GRID_MIN_CELL + metrics.gap_x))
+        let columns = ((metrics.width + metrics.gap_x) / (metrics.min_cell.clamp(GRID_MIN_CELL, GRID_MAX_CELL) + metrics.gap_x))
             .floor()
             .max(1.0) as usize;
         let cell_width =
@@ -179,6 +185,7 @@ mod tests {
             name_height: 16.0,
             date_height: 12.0,
             header_height: 40.0,
+            min_cell: GRID_DEFAULT_CELL,
         }
     }
 
@@ -207,6 +214,19 @@ mod tests {
         assert!(layout.matches(1, &metrics(1000.2), true, true));
         assert!(!layout.matches(2, &metrics(1000.0), true, true));
         assert!(!layout.matches(1, &metrics(1000.0), false, true));
+        let bigger = GridMetrics {
+            min_cell: 320.0,
+            ..metrics(1000.0)
+        };
+        assert!(!layout.matches(1, &bigger, true, true));
+        assert_eq!(
+            GridLayout::build(&[(0, 10)], 10, 1, bigger, true, true).columns,
+            3
+        );
+        assert_eq!(
+            GridLayout::build(&[(0, 10)], 10, 1, GridMetrics { min_cell: 9999.0, ..metrics(1000.0) }, true, true).columns,
+            3
+        );
     }
 
     #[test]

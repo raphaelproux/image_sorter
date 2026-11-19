@@ -4,7 +4,10 @@ use eframe::egui::{
     self, ColorImage, Key, Modifiers, PointerButton, TextureHandle, TextureOptions, Vec2,
 };
 use flate2::read::ZlibDecoder;
-use grid::{group_ranges, GridItemKind, GridLayout, GridMetrics};
+use grid::{
+    group_ranges, GridItemKind, GridLayout, GridMetrics, GRID_DEFAULT_CELL, GRID_MAX_CELL,
+    GRID_MIN_CELL,
+};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use image::{ImageDecoder, ImageReader};
@@ -38,6 +41,7 @@ const PREFETCH_BEHIND: usize = 2;
 const ACTIVE_VIEW_IMAGE_PRIORITY: u8 = 240;
 const MAX_TEXTURE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PREVIEW_QUEUE: usize = 512;
+const MAX_HISTORY: usize = 100;
 const GRID_VISIBLE_PRIORITY: u8 = 50;
 const GRID_NEAR_PRIORITY: u8 = 30;
 const DATETIME_WORKERS: usize = 3;
@@ -157,6 +161,16 @@ struct PreviewPool {
     cache_size: AtomicUsize,
 }
 
+impl PreviewPool {
+    /// Drops every waiting job (a new folder was opened: nothing queued is relevant anymore).
+    fn clear_jobs(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.jobs.clear();
+            queue.active.clear();
+        }
+    }
+}
+
 struct OperationResult {
     kind: ActionKind,
     history: HistoryEntry,
@@ -174,6 +188,9 @@ enum OperationMessage {
 
 fn default_show_datetime() -> bool {
     true
+}
+fn default_grid_cell_size() -> f32 {
+    GRID_DEFAULT_CELL
 }
 fn default_show_filenames() -> bool {
     true
@@ -222,6 +239,8 @@ struct Settings {
     show_datetime: bool,
     #[serde(default = "default_show_filenames")]
     show_filenames: bool,
+    #[serde(default = "default_grid_cell_size")]
+    grid_cell_size: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -310,6 +329,7 @@ impl Default for SorterApp {
                 show_exif: false,
                 show_datetime: true,
                 show_filenames: true,
+                grid_cell_size: GRID_DEFAULT_CELL,
             });
         let (scan_sender, scan_receiver) = mpsc::channel();
         let (exif_sender, exif_receiver) = mpsc::channel();
@@ -327,6 +347,12 @@ impl Default for SorterApp {
         let worker_count = std::thread::available_parallelism()
             .map_or(4, usize::from)
             .clamp(4, 6);
+        {
+            // Learn the real size of the disk cache (the counter starts at 0 on every launch).
+            let pool = Arc::clone(&preview_pool);
+            let cache = preview_cache.clone();
+            thread::spawn(move || trim_preview_cache(&cache, &pool));
+        }
         for _ in 0..worker_count {
             let pool = Arc::clone(&preview_pool);
             let sender = texture_sender.clone();
@@ -424,10 +450,38 @@ fn stem_key(path: &Path) -> String {
         .to_string()
 }
 
+/// Plain read/write copy. `fs::copy` and `io::copy` use `copy_file_range`/ioctls that network
+/// filesystems (CIFS/Samba) can reject with "Inappropriate ioctl for device".
+fn copy_file(source: &Path, destination: &Path) -> std::io::Result<u64> {
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::create(destination)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    let result = (|| loop {
+        let read = match input.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        };
+        output.write_all(&buffer[..read])?;
+        total += read as u64;
+    })()
+    .and_then(|()| output.flush());
+    drop(output);
+    match result {
+        Ok(()) => Ok(total),
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            Err(error)
+        }
+    }
+}
+
 fn move_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
-        Err(rename_error) => match fs::copy(source, destination) {
+        Err(rename_error) => match copy_file(source, destination) {
             Ok(_) => match fs::remove_file(source) {
                 Ok(()) => Ok(()),
                 Err(remove_error) => {
@@ -1047,6 +1101,21 @@ fn exif_datetime(fields: &[(exif::Tag, String, String)]) -> Option<String> {
     })
 }
 
+/// `photo.jpg` with suffix 2 becomes `photo_2.jpg`; suffix 0 keeps the name.
+fn suffixed_name(name: &Path, suffix: u32) -> PathBuf {
+    if suffix == 0 {
+        return name.to_path_buf();
+    }
+    let stem = name
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    PathBuf::from(match name.extension().and_then(|value| value.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("{stem}_{suffix}.{ext}"),
+        _ => format!("{stem}_{suffix}"),
+    })
+}
+
 fn process_files(
     kind: ActionKind,
     root: PathBuf,
@@ -1098,12 +1167,43 @@ fn process_files(
     let total = files.len();
     let mut errors = Vec::new();
     let mut completed = HashSet::new();
+    let mut suffixes: HashMap<PathBuf, u32> = HashMap::new();
+    if kind == ActionKind::Keep {
+        let mut reserved: HashSet<PathBuf> = HashSet::new();
+        for (_, group) in &photo_files {
+            let names: Vec<&std::ffi::OsStr> = group
+                .iter()
+                .filter_map(|file| file.file_name())
+                .collect();
+            let suffix = (0u32..)
+                .find(|suffix| {
+                    names.iter().all(|name| {
+                        let candidate = destination.join(suffixed_name(Path::new(name), *suffix));
+                        !candidate.exists() && !reserved.contains(&candidate)
+                    })
+                })
+                .unwrap_or(0);
+            for name in names {
+                reserved.insert(destination.join(suffixed_name(Path::new(name), suffix)));
+            }
+            for file in group {
+                suffixes.insert(file.clone(), suffix);
+            }
+        }
+    }
     for (position, source) in files.into_iter().enumerate() {
         if !source.exists() || completed.contains(&source) {
             continue;
         }
-        let relative = source.strip_prefix(&root).unwrap_or(&source);
-        let mut target = destination.join(relative);
+        let mut target = if kind == ActionKind::Keep {
+            // Kept files sit side by side; a clash is solved with a number suffix, shared by
+            // all files of a photo so that RAW and JPEG keep the same name.
+            let name = source.file_name().unwrap_or_default();
+            let suffix = suffixes.get(&source).copied().unwrap_or(0);
+            destination.join(suffixed_name(Path::new(name), suffix))
+        } else {
+            destination.join(source.strip_prefix(&root).unwrap_or(&source))
+        };
         if let Some(parent) = target.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
                 errors.push(format!("{}: {error}", parent.display()));
@@ -1136,7 +1236,7 @@ fn process_files(
             }
         }
         let result = match kind {
-            ActionKind::Keep => fs::copy(&source, &target).map(|_| ()),
+            ActionKind::Keep => copy_file(&source, &target).map(|_| ()),
             ActionKind::Delete => move_file(&source, &target),
         };
         match result {
@@ -1339,10 +1439,15 @@ fn write_cached_preview(cache: &Path, key: &TextureKey, image: &ColorImage, pool
         .fetch_add(compressed.len(), std::sync::atomic::Ordering::Relaxed)
         .saturating_add(compressed.len())
         > MAX_TEXTURE_CACHE_BYTES
+        && !CACHE_TRIMMING.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
+        // One trimmer at a time: concurrent workers would all list the whole directory.
         trim_preview_cache(cache, pool);
+        CACHE_TRIMMING.store(false, std::sync::atomic::Ordering::Release);
     }
 }
+
+static CACHE_TRIMMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn trim_preview_cache(cache: &Path, pool: &PreviewPool) {
     let Ok(entries) = fs::read_dir(cache) else {
@@ -1366,9 +1471,12 @@ fn trim_preview_cache(cache: &Path, pool: &PreviewPool) {
     if total <= MAX_TEXTURE_CACHE_BYTES as u64 {
         return;
     }
+    // Trim well below the limit: trimming exactly to it would rescan the whole directory
+    // again after every single thumbnail written.
+    let target = (MAX_TEXTURE_CACHE_BYTES / 4 * 3) as u64;
     files.sort_by_key(|(_, _, modified)| *modified);
     for (path, size, _) in files {
-        if total <= MAX_TEXTURE_CACHE_BYTES as u64 {
+        if total <= target {
             break;
         }
         if fs::remove_file(path).is_ok() {
@@ -1415,7 +1523,13 @@ fn enqueue_preview(
     if priority >= 90 {
         let mut index = 0;
         while index < queue.jobs.len() {
-            if queue.jobs[index].priority >= 90 && queue.jobs[index].key.path != key.path {
+            let other = &queue.jobs[index];
+            // Zooming asks for a new size at every wheel step: a superseded full-size request
+            // of the same photo is dropped instead of being decoded for nothing.
+            let superseded = priority == ACTIVE_VIEW_IMAGE_PRIORITY
+                && other.priority == ACTIVE_VIEW_IMAGE_PRIORITY
+                && other.key != *key;
+            if (other.priority >= 90 && other.key.path != key.path) || superseded {
                 let removed = queue.jobs.swap_remove(index);
                 queue.active.remove(&removed.key);
             } else {
@@ -1495,13 +1609,17 @@ fn preview_worker(
             } else {
                 None
             };
-            let image = cached.or_else(|| {
-                let image = decode_preview(&job.key.path, job.size)?;
-                if cacheable {
-                    write_cached_preview(&cache, &actual_key, &image, &pool);
-                }
-                Some(image)
-            });
+            // A decoder panic on a corrupt file must not kill the worker for good.
+            let image = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cached.or_else(|| {
+                    let image = decode_preview(&job.key.path, job.size)?;
+                    if cacheable {
+                        write_cached_preview(&cache, &actual_key, &image, &pool);
+                    }
+                    Some(image)
+                })
+            }))
+            .unwrap_or(None);
             match image {
                 Some(image) => PreviewOutcome::Ready(image),
                 None => PreviewOutcome::Failed,
@@ -1809,35 +1927,53 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     ))
 }
 
-fn scan_keep_folder(root: &Path) -> HashSet<PathBuf> {
-    WalkDir::new(root)
+/// File name -> sizes of the files of that name found anywhere in the keep folder. A copy that
+/// got a clash suffix (`photo_2.jpg`) is also registered under its original name (`photo.jpg`).
+type KeepFiles = HashMap<std::ffi::OsString, Vec<u64>>;
+
+fn scan_keep_folder(root: &Path) -> KeepFiles {
+    let mut files: KeepFiles = HashMap::new();
+    for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.path().to_path_buf())
-        .collect()
+    {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let size = metadata.len();
+        let name = entry.file_name();
+        files.entry(name.to_os_string()).or_default().push(size);
+        if let Some(original) = unsuffixed_name(Path::new(name)) {
+            files.entry(original.into_os_string()).or_default().push(size);
+        }
+    }
+    files
 }
 
-fn is_kept(photo: &Photo, root: &Path, keep_folder: &Path, keep_files: &HashSet<PathBuf>) -> bool {
-    let Ok(relative) = photo.display.strip_prefix(root) else {
-        return false;
-    };
-    let kept_path = keep_folder.join(relative);
-    let equivalent = |left: &Path, right: &Path| {
-        let Ok(left) = fs::canonicalize(left) else {
+/// `photo_2.jpg` -> `photo.jpg`.
+fn unsuffixed_name(name: &Path) -> Option<PathBuf> {
+    let stem = name.file_stem()?.to_str()?;
+    let (base, number) = stem.rsplit_once('_')?;
+    if base.is_empty() || number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(match name.extension() {
+        Some(ext) => PathBuf::from(format!("{base}.{}", ext.to_string_lossy())),
+        None => PathBuf::from(base),
+    })
+}
+
+/// A photo counts as kept when the keep folder holds a file with the name and size of any of its
+/// files (the keep folder is flat, so the original sub-folder says nothing).
+fn is_kept(photo: &Photo, keep_files: &KeepFiles) -> bool {
+    photo.files.iter().any(|file| {
+        let Some(sizes) = file.file_name().and_then(|name| keep_files.get(name)) else {
             return false;
         };
-        fs::canonicalize(right).is_ok_and(|right| left == right)
-    };
-    keep_files.contains(&kept_path)
-        || equivalent(&kept_path, &photo.display)
-        || photo.files.iter().any(|file| {
-            file.strip_prefix(root)
-                .ok()
-                .map(|relative| keep_folder.join(relative))
-                .is_some_and(|kept| keep_files.contains(&kept) || equivalent(&kept, file))
-        })
+        fs::metadata(file).is_ok_and(|metadata| sizes.contains(&metadata.len()))
+    })
 }
 
 fn scan_folder(root: &Path) -> Vec<Photo> {
@@ -1932,12 +2068,18 @@ impl SorterApp {
             return;
         };
         self.keep_scan_generation = self.keep_scan_generation.wrapping_add(1);
+        if self.keep_scan_pending {
+            // A scan is still walking the keep folder: do not stack another thread on top.
+            // Its (now outdated) result is dropped and a fresh scan follows right after.
+            self.keep_dirty
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let generation = self.keep_scan_generation;
         let sender = self.keep_scan_sender.clone();
         let repaint = ctx.clone();
         self.keep_scan_pending = true;
         self.next_keep_scan = std::time::Instant::now() + KEEP_POLL_INTERVAL;
-        let root = self.root.clone().unwrap_or_default();
         let snapshot: Vec<Photo> = self
             .photos
             .iter()
@@ -1953,12 +2095,15 @@ impl SorterApp {
             })
             .collect();
         thread::spawn(move || {
-            let files = scan_keep_folder(&keep_folder);
-            let kept: HashSet<PathBuf> = snapshot
-                .iter()
-                .filter(|photo| is_kept(photo, &root, &keep_folder, &files))
-                .map(|photo| photo.display.clone())
-                .collect();
+            let kept = std::panic::catch_unwind(|| {
+                let files = scan_keep_folder(&keep_folder);
+                snapshot
+                    .iter()
+                    .filter(|photo| is_kept(photo, &files))
+                    .map(|photo| photo.display.clone())
+                    .collect::<HashSet<PathBuf>>()
+            })
+            .unwrap_or_default();
             let _ = sender.send((generation, kept));
             repaint.request_repaint();
         });
@@ -2013,6 +2158,9 @@ impl SorterApp {
                 for photo in &mut self.photos {
                     photo.kept = kept.contains(&photo.display);
                 }
+            } else {
+                self.keep_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         } else if self.keep_scan_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
@@ -2042,6 +2190,10 @@ impl SorterApp {
             self.root = Some(folder.clone());
             self.photos.clear();
             self.photos_changed();
+            self.grid_layout = None;
+            self.history.clear();
+            self.expanded_exif.clear();
+            self.last_viewer_image = None;
             self.selection.clear();
             self.anchor = None;
             self.source_sizes.clear();
@@ -2122,7 +2274,8 @@ impl SorterApp {
                 let mut last_flush = std::time::Instant::now();
                 while !scan.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     let Some(path) = scan.next() else { break };
-                    let datetime = read_datetime(&path);
+                    let datetime = std::panic::catch_unwind(|| read_datetime(&path))
+                        .unwrap_or(None);
                     batch.push((path, datetime));
                     if batch.len() >= 64
                         || last_flush.elapsed() >= std::time::Duration::from_millis(150)
@@ -2245,6 +2398,8 @@ impl SorterApp {
     }
 
     fn clear_textures(&mut self) {
+        self.preview_pool.clear_jobs();
+        self.grid_window = (usize::MAX, usize::MAX);
         self.textures.clear();
         self.texture_bytes = 0;
         self.queued_textures.clear();
@@ -2732,6 +2887,9 @@ impl SorterApp {
                     } else {
                         if !result.history.files.is_empty() {
                             self.history.push(result.history);
+                            if self.history.len() > MAX_HISTORY {
+                                self.history.remove(0);
+                            }
                         }
                         self.notice = if result.errors.is_empty() {
                             format!(
@@ -3066,6 +3224,7 @@ impl SorterApp {
                     name_height: name_height + 2.0,
                     date_height: date_height + 2.0,
                     header_height: 8.0 + title_height + spacing.y * 2.0 + 1.0,
+                    min_cell: self.settings.grid_cell_size,
                 };
                 let mut layout = match self.grid_layout.take() {
                     Some(layout)
@@ -3400,6 +3559,21 @@ impl eframe::App for SorterApp {
                 }
                 if ui.checkbox(&mut self.settings.show_exif, "EXIF").changed() {
                     self.save_settings();
+                }
+                if self.mode == ViewMode::Grid {
+                    let slider = ui
+                        .add(
+                            egui::Slider::new(
+                                &mut self.settings.grid_cell_size,
+                                GRID_MIN_CELL..=GRID_MAX_CELL,
+                            )
+                            .show_value(false)
+                            .text("Size"),
+                        )
+                        .on_hover_text("Thumbnail size in the grid");
+                    if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                        self.save_settings();
+                    }
                 }
                 if ui.button(format!("Keep ({})", keep_shortcut)).clicked() {
                     self.sort_photos(ActionKind::Keep, ctx);
@@ -3975,6 +4149,7 @@ mod tests {
             datetime: None,
             exif: Vec::new(),
             exif_loaded: false,
+            datetime_loaded: false,
             kept: false,
         };
         // 4 columns: folder a has 6 photos (rows 4 + 2), folder b has 5 (rows 4 + 1).
@@ -4018,12 +4193,75 @@ mod tests {
     }
 
     #[test]
-    fn kept_status_matches_relative_file_path_and_pair_member() {
-        let root = PathBuf::from("/photos/source");
-        let keep = PathBuf::from("/photos/keep");
+    fn keep_copies_flat_and_numbers_clashing_pairs_together() {
+        let root = std::env::temp_dir().join(format!("image_sorter_flat_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("src");
+        let keep = root.join("keep");
+        let mut photos = Vec::new();
+        for folder in ["a", "b"] {
+            fs::create_dir_all(source.join(folder)).unwrap();
+            let jpg = source.join(folder).join("img.jpg");
+            let raw = source.join(folder).join("img.rw2");
+            fs::write(&jpg, folder.as_bytes()).unwrap();
+            fs::write(&raw, folder.as_bytes()).unwrap();
+            photos.push(Photo {
+                display: jpg.clone(),
+                files: vec![jpg, raw],
+                subfolder: PathBuf::from(folder),
+                datetime: None,
+                exif: Vec::new(),
+                exif_loaded: false,
+                datetime_loaded: false,
+                kept: false,
+            });
+        }
+        // The first name is already taken in the keep folder, by a lone JPEG.
+        fs::create_dir_all(&keep).unwrap();
+        fs::write(keep.join("img.jpg"), b"old").unwrap();
+        let photo_files: Vec<_> = photos
+            .iter()
+            .map(|photo| (photo.display.clone(), photo.files.clone()))
+            .collect();
+        let files = photo_files.iter().flat_map(|(_, f)| f.clone()).collect();
+        let (sender, _receiver) = mpsc::channel();
+        let result = process_files(
+            ActionKind::Keep,
+            source.clone(),
+            keep.clone(),
+            files,
+            photo_files,
+            photos,
+            sender,
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let mut names: Vec<String> = fs::read_dir(&keep)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["img.jpg", "img_1.jpg", "img_1.rw2", "img_2.jpg", "img_2.rw2"]
+        );
+        assert_eq!(fs::read(keep.join("img_1.rw2")).unwrap(), b"a");
+        assert_eq!(fs::read(keep.join("img_2.jpg")).unwrap(), b"b");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kept_status_matches_flat_keep_folder_by_name_and_size() {
+        let root = std::env::temp_dir().join(format!("image_sorter_kept_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/trip")).unwrap();
+        fs::create_dir_all(root.join("keep/deep")).unwrap();
+        let jpg = root.join("src/trip/photo.JPG");
+        let raw = root.join("src/trip/photo.ARW");
+        fs::write(&jpg, b"jpeg data").unwrap();
+        fs::write(&raw, b"raw data!!").unwrap();
         let photo = Photo {
-            display: root.join("trip/photo.JPG"),
-            files: vec![root.join("trip/photo.JPG"), root.join("trip/photo.ARW")],
+            display: jpg.clone(),
+            files: vec![jpg.clone(), raw.clone()],
             subfolder: PathBuf::from("trip"),
             datetime: None,
             exif: Vec::new(),
@@ -4031,9 +4269,19 @@ mod tests {
             datetime_loaded: false,
             kept: false,
         };
-        let raw_copy = keep.join("trip/photo.ARW");
-        assert!(is_kept(&photo, &root, &keep, &HashSet::from([raw_copy])));
-        assert!(!is_kept(&photo, &root, &keep, &HashSet::new()));
+        assert!(!is_kept(&photo, &scan_keep_folder(&root.join("keep"))));
+        // Same name but another size: a different photo.
+        fs::write(root.join("keep/photo.ARW"), b"other").unwrap();
+        assert!(!is_kept(&photo, &scan_keep_folder(&root.join("keep"))));
+        fs::write(root.join("keep/deep/photo_2.ARW"), b"raw data!!").unwrap();
+        assert!(is_kept(&photo, &scan_keep_folder(&root.join("keep"))));
+        assert_eq!(
+            unsuffixed_name(Path::new("photo_12.ARW")),
+            Some(PathBuf::from("photo.ARW"))
+        );
+        assert_eq!(unsuffixed_name(Path::new("photo.ARW")), None);
+        assert_eq!(suffixed_name(Path::new("photo.ARW"), 3), PathBuf::from("photo_3.ARW"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4123,6 +4371,58 @@ mod tests {
             order,
             vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
         );
+    }
+
+    #[test]
+    fn viewer_requests_replace_superseded_sizes_and_clearing_empties_the_queue() {
+        let pool = PreviewPool {
+            queue: std::sync::Mutex::new(PreviewQueue::default()),
+            ready: std::sync::Condvar::new(),
+            cache_size: AtomicUsize::new(0),
+        };
+        let ctx = egui::Context::default();
+        let path = Path::new("photo.jpg");
+        for width in [1000, 1100, 1200] {
+            let size = (width, width * 3 / 4);
+            assert!(enqueue_preview(
+                &pool,
+                &texture_key(path, size),
+                size,
+                ACTIVE_VIEW_IMAGE_PRIORITY,
+                ctx.clone()
+            ));
+        }
+        assert!(enqueue_preview(
+            &pool,
+            &texture_key(path, VIEW_PREVIEW),
+            VIEW_PREVIEW,
+            ACTIVE_VIEW_PREVIEW_PRIORITY,
+            ctx.clone()
+        ));
+        {
+            let queue = pool.queue.lock().unwrap();
+            assert_eq!(queue.jobs.len(), 2);
+            assert_eq!(queue.active.len(), 2);
+        }
+        pool.clear_jobs();
+        let queue = pool.queue.lock().unwrap();
+        assert!(queue.jobs.is_empty() && queue.active.is_empty());
+    }
+
+    #[test]
+    fn copy_file_copies_contents_without_special_syscalls() {
+        let root = std::env::temp_dir().join(format!("image_sorter_copy_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("a.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|value| (value % 251) as u8).collect();
+        fs::write(&source, &data).unwrap();
+        let target = root.join("b.bin");
+        assert_eq!(copy_file(&source, &target).unwrap(), data.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), data);
+        assert!(copy_file(&root.join("missing"), &root.join("c.bin")).is_err());
+        assert!(!root.join("c.bin").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

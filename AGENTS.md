@@ -50,6 +50,18 @@ All requested features are implemented. Latest round (all done, `cargo check` an
 - RW2 without a JPEG: `rw2_locate`/`rw2_embedded_jpeg` read the embedded full-size JPEG (IFD0 tag 0x2E, orientation 0x112) by byte range; `decode_preview` and `viewer_decode_size` use it, and `parse_exif` patches the RW2 magic (0x55 -> 0x2A) so EXIF/date work. `system_thumbnail_at` still fails on `zTXt`-compressed URIs (harmless now for RW2).
 - Full-res RAW: `decode_raw` develops the file with `imagepipe` (rawloader + demosaic/WB/sRGB; max 2 concurrent via `RawSlot`, side capped at `MAX_RAW_SIDE`). RW2 grid thumbnails and fit-to-window views keep using the embedded JPEG; the RAW is developed only when a bigger size is requested (zoom, `rw2_needs_raw`). `viewer_decode_size` returns the RAW size (`raw_dimensions`, via `decode_dummy`, ~12 ms). Other RAW formats (ARW, CR2, NEF...) go through `decode_raw` directly (untested: no samples).
 
+## Leak/slowdown fixes (latest round)
+- `clear_textures` also empties the preview queue (`PreviewPool::clear_jobs`) and resets `grid_window`; opening a folder also clears `history`, `grid_layout`, `expanded_exif`. History is capped (`MAX_HISTORY`).
+- Preview/date workers wrap decoding in `catch_unwind` (a panic used to kill a worker permanently, shrinking the pool). Superseded full-size viewer requests (zoom steps) are dropped in `enqueue_preview`.
+- Disk preview cache: size is measured at startup; trimming goes down to 75% and only one trimmer runs (`CACHE_TRIMMING`).
+- Keep scan: no stacked scan threads; `is_kept` takes a precomputed `same_tree` flag (no per-photo `canonicalize`, costly on SMB).
+- Keep copy uses `copy_file` (plain read/write loop) instead of `fs::copy`, which fails with ENOTTY ("Inappropriate ioctl", os error 25) on CIFS/Samba. `move_file` fallback also uses it.
+
+## Flat keep + grid size (latest round)
+- Keep copies files flat into the keep folder (no subfolders). `process_files` precomputes one clash suffix per photo (`_1`, `_2`...) via `suffixed_name`, shared by its RAW+JPEG so pair names stay aligned. Delete still preserves the relative path.
+- Kept status: `scan_keep_folder` returns `KeepFiles` (file name -> sizes, suffixed copies also registered under the original name via `unsuffixed_name`); `is_kept(photo, &keep_files)` matches name + size of any of the photo's files.
+- Toolbar slider (grid mode only) sets `Settings.grid_cell_size` (80..=320, default 160, saved) -> `GridMetrics.min_cell`; 320 max because thumbnails are decoded at 320x240.
+
 ## Known caveats / possible follow-ups
 - Photos without any EXIF data are re-read each frame while `show_exif` is on and `exif` is empty (cheap failure, but could be guarded with a "loaded" flag).
 - Optionally build a fuller tag ID -> name table from `EXIF Tags.html` if kamadak-exif names are insufficient (many MakerNote/unknown tags show as "Unknown EXIF tag 0xXXXX" and fall in "Others").
