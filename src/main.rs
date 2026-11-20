@@ -55,6 +55,11 @@ fn grid_preview_size(cell_width: f32, pixels_per_point: f32) -> (u32, u32) {
     }
 }
 const ACTIVE_VIEW_PREVIEW_PRIORITY: u8 = 250;
+/// Jobs at or above this priority belong to the photo on screen (the others are grid thumbnails
+/// and neighbours prefetched in the background).
+const URGENT_PRIORITY: u8 = 90;
+/// Workers that only run urgent jobs: background work can never occupy every thread.
+const URGENT_WORKERS: usize = 2;
 const PREFETCH_PRIORITY: u8 = 80;
 const PREFETCH_MIN_PRIORITY: u8 = 60;
 const PREFETCH_AHEAD: usize = 3;
@@ -104,17 +109,17 @@ fn pick_grid_anchor(layout: &GridLayout, offset: f32, view_height: f32) -> Optio
 }
 
 /// Small "Kept" pill whose top-right corner is at `top_right`; returns its rectangle.
-fn paint_kept_badge(ui: &egui::Ui, top_right: egui::Pos2) -> egui::Rect {
+fn paint_kept_badge(ui: &egui::Ui, top_right: egui::Pos2, scale: f32) -> egui::Rect {
     let visuals = &ui.visuals().widgets.inactive;
     let text = ui.painter().layout_no_wrap(
         "Kept".into(),
-        egui::FontId::proportional(10.0),
+        egui::FontId::proportional(10.0 * scale),
         visuals.fg_stroke.color,
     );
-    let padding = egui::vec2(5.0, 2.0);
+    let padding = egui::vec2(5.0, 2.0) * scale;
     let size = text.size() + padding * 2.0;
     let rect = egui::Rect::from_min_size(egui::pos2(top_right.x - size.x, top_right.y), size);
-    ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    ui.painter().rect_filled(rect, 3.0 * scale, visuals.bg_fill);
     ui.painter()
         .galley(rect.min + padding, text, visuals.fg_stroke.color);
     rect
@@ -472,11 +477,12 @@ impl Default for SorterApp {
             let cache = preview_cache.clone();
             thread::spawn(move || trim_preview_cache(&cache, &pool));
         }
-        for _ in 0..worker_count {
+        for index in 0..worker_count + URGENT_WORKERS {
             let pool = Arc::clone(&preview_pool);
             let sender = texture_sender.clone();
             let cache = preview_cache.clone();
-            thread::spawn(move || preview_worker(pool, sender, cache));
+            let min_priority = if index < worker_count { 0 } else { URGENT_PRIORITY };
+            thread::spawn(move || preview_worker(pool, sender, cache, min_priority));
         }
         Self {
             settings,
@@ -707,6 +713,11 @@ fn is_raw(path: &Path) -> bool {
 /// Full-resolution RAW decoding (demosaic, white balance, colour matrix, sRGB curve) is memory
 /// hungry (about 0.5 GB for a 16 MP image): allow only a couple at a time.
 const MAX_RAW_DECODES: usize = 2;
+
+thread_local! {
+    /// Set by the preview worker while it runs a job for the photo on screen.
+    static URGENT_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 static RAW_SLOTS: (std::sync::Mutex<usize>, std::sync::Condvar) =
     (std::sync::Mutex::new(0), std::sync::Condvar::new());
 /// Largest side handed to the GPU (typical OpenGL limit is 16384, older drivers 8192).
@@ -718,7 +729,10 @@ impl RawSlot {
     fn acquire() -> Option<Self> {
         let (lock, condvar) = &RAW_SLOTS;
         let mut running = lock.lock().ok()?;
-        while *running >= MAX_RAW_DECODES {
+        // The photo on screen gets one more slot than the background work, so it never waits
+        // behind neighbours.
+        let limit = MAX_RAW_DECODES + usize::from(URGENT_JOB.with(|urgent| urgent.get()));
+        while *running >= limit {
             running = condvar.wait(running).ok()?;
         }
         *running += 1;
@@ -732,7 +746,7 @@ impl Drop for RawSlot {
         if let Ok(mut running) = lock.lock() {
             *running = running.saturating_sub(1);
         }
-        condvar.notify_one();
+        condvar.notify_all();
     }
 }
 
@@ -1642,7 +1656,7 @@ fn enqueue_preview(
         // A worker is already decoding it.
         return false;
     }
-    if priority >= 90 {
+    if priority >= URGENT_PRIORITY {
         let mut index = 0;
         while index < queue.jobs.len() {
             let other = &queue.jobs[index];
@@ -1651,7 +1665,7 @@ fn enqueue_preview(
             let superseded = priority == ACTIVE_VIEW_IMAGE_PRIORITY
                 && other.priority == ACTIVE_VIEW_IMAGE_PRIORITY
                 && other.key != *key;
-            if (other.priority >= 90 && other.key.path != key.path) || superseded {
+            if (other.priority >= URGENT_PRIORITY && other.key.path != key.path) || superseded {
                 let removed = queue.jobs.swap_remove(index);
                 queue.active.remove(&removed.key);
             } else {
@@ -1667,7 +1681,7 @@ fn enqueue_preview(
             .min_by_key(|(_, job)| job.priority)
             .map(|(index, job)| (index, job.priority));
         match lowest {
-            Some((index, lowest)) if lowest < priority || priority >= 90 => {
+            Some((index, lowest)) if lowest < priority || priority >= URGENT_PRIORITY => {
                 let removed = queue.jobs.swap_remove(index);
                 queue.active.remove(&removed.key);
             }
@@ -1683,14 +1697,24 @@ fn enqueue_preview(
         deadline: std::time::Instant::now() + job_timeout(priority),
     });
     drop(queue);
-    pool.ready.notify_one();
+    // Some workers only take urgent jobs: waking just one could wake the wrong kind.
+    pool.ready.notify_all();
     true
 }
 
 /// Removes and returns the most urgent job; equally urgent jobs run in request order.
+#[cfg(test)]
 fn take_best_job(jobs: &mut Vec<PreviewJob>) -> Option<PreviewJob> {
+    take_best_job_from(jobs, 0)
+}
+
+/// Like `take_best_job`, ignoring the jobs below `min_priority`.
+fn take_best_job_from(jobs: &mut Vec<PreviewJob>, min_priority: u8) -> Option<PreviewJob> {
     let mut best: Option<usize> = None;
     for (index, job) in jobs.iter().enumerate() {
+        if job.priority < min_priority {
+            continue;
+        }
         if best.is_none_or(|current| job.priority > jobs[current].priority) {
             best = Some(index);
         }
@@ -1702,6 +1726,7 @@ fn preview_worker(
     pool: Arc<PreviewPool>,
     sender: Sender<(TextureKey, TextureKey, PreviewOutcome)>,
     cache: PathBuf,
+    min_priority: u8,
 ) {
     loop {
         let job = {
@@ -1709,7 +1734,7 @@ fn preview_worker(
                 return;
             };
             loop {
-                if let Some(job) = take_best_job(&mut queue.jobs) {
+                if let Some(job) = take_best_job_from(&mut queue.jobs, min_priority) {
                     break job;
                 }
                 let Ok(next) = pool.ready.wait(queue) else {
@@ -1722,6 +1747,7 @@ fn preview_worker(
             fingerprint: texture_fingerprint(&job.key.path),
             ..job.key.clone()
         };
+        URGENT_JOB.with(|urgent| urgent.set(job.priority >= URGENT_PRIORITY));
         let outcome = if job.deadline <= std::time::Instant::now() {
             PreviewOutcome::Expired
         } else {
@@ -2821,6 +2847,18 @@ impl SorterApp {
         }
     }
 
+    /// Is a texture of at least `size` loaded for `path`?
+    fn has_texture(&mut self, path: &Path, size: (u32, u32)) -> bool {
+        let key = self.cached_texture_key(path, size);
+        self.textures.get(path).is_some_and(|entries| {
+            entries.iter().any(|existing| {
+                existing.key.fingerprint == key.fingerprint
+                    && existing.key.width >= key.width
+                    && existing.key.height >= key.height
+            })
+        })
+    }
+
     /// Grid thumbnail: returns it when loaded, otherwise (re)requests it with `priority`.
     fn grid_thumbnail(
         &mut self,
@@ -3562,13 +3600,14 @@ impl SorterApp {
                         painter.rect_filled(thumb_rect, 0.0, GRID_PHOTO_BACKGROUND);
                         if kept && !show_filenames {
                             // No filename on that row: the badge sits alone above the photo.
-                            paint_kept_badge(ui, egui::pos2(cell_rect.right(), top));
+                            paint_kept_badge(ui, egui::pos2(cell_rect.right(), top), 1.0);
                         }
                         if show_filenames {
                             let kept_width = if kept {
                                 let badge = paint_kept_badge(
                                     ui,
                                     egui::pos2(cell_rect.right(), text_top),
+                                    1.0,
                                 );
                                 badge.width() + spacing.x
                             } else {
@@ -4045,11 +4084,6 @@ impl eframe::App for SorterApp {
                                     None => "…",
                                 });
                             }
-                            if photo.kept {
-                                ui.label("Kept").on_hover_text(
-                                    "This photo has been copied to the keep folder.",
-                                );
-                            }
                         });
                     });
                 }
@@ -4133,7 +4167,13 @@ impl eframe::App for SorterApp {
                 } else {
                     viewer_request_size(source_size, viewport, self.zoom)
                 };
-                if self.zoom <= 1.0 && self.photos.len() > 1 {
+                // Neighbours are prefetched once the photo on screen is there, so they never
+                // compete with it for disk, network or CPU.
+                let requested_key = self.cached_texture_key(&photo.display, requested_size);
+                let current_ready = self.source_sizes.contains_key(&photo.display)
+                    && (self.has_texture(&photo.display, requested_size)
+                        || self.failed_textures.contains(&requested_key));
+                if self.zoom <= 1.0 && self.photos.len() > 1 && current_ready {
                     let count = self.photos.len();
                     let mut neighbours: Vec<(usize, u8)> = Vec::new();
                     for distance in 1..=PREFETCH_AHEAD.max(PREFETCH_BEHIND) {
@@ -4244,6 +4284,16 @@ impl eframe::App for SorterApp {
                         egui::FontId::default(),
                         egui::Color32::WHITE,
                     );
+                }
+                if photo.kept {
+                    // Top right corner of the image area, whatever the info strip shows.
+                    let badge = paint_kept_badge(
+                        ui,
+                        egui::pos2(rect.right() - 8.0, rect.top() + 8.0),
+                        1.3,
+                    );
+                    ui.interact(badge, ui.id().with("kept_badge"), egui::Sense::hover())
+                        .on_hover_text("This photo has been copied to the keep folder.");
                 }
             });
         } else {
