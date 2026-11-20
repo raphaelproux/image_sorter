@@ -33,6 +33,27 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "tif", "
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TEXTURE_MEMORY: usize = 512 * 1024 * 1024;
 const VIEW_PREVIEW: (u32, u32) = (320, 240);
+/// Sharper grid thumbnails, only requested when the cells are large (see `grid_preview_size`).
+const GRID_HD_PREVIEW: (u32, u32) = (640, 480);
+/// Cell width (physical pixels) beyond which the fast 320x240 thumbnails would be upscaled.
+const GRID_HD_CELL_PIXELS: f32 = 320.0;
+/// Fewer thumbnails are prefetched in HD: they are four times as big in memory.
+const GRID_HD_PREFETCH_LIMIT: usize = 120;
+
+/// The two thumbnail sizes: decoded through the fast path (cache, embedded thumbnails).
+fn is_thumb(size: (u32, u32)) -> bool {
+    size == VIEW_PREVIEW || size == GRID_HD_PREVIEW
+}
+
+/// Fast thumbnails while zoomed out, HD ones once a cell has more than `GRID_HD_CELL_PIXELS`
+/// physical pixels of width.
+fn grid_preview_size(cell_width: f32, pixels_per_point: f32) -> (u32, u32) {
+    if cell_width * pixels_per_point > GRID_HD_CELL_PIXELS {
+        GRID_HD_PREVIEW
+    } else {
+        VIEW_PREVIEW
+    }
+}
 const ACTIVE_VIEW_PREVIEW_PRIORITY: u8 = 250;
 const PREFETCH_PRIORITY: u8 = 80;
 const PREFETCH_MIN_PRIORITY: u8 = 60;
@@ -48,6 +69,56 @@ const GRID_SCROLL_BASE: f32 = 3.0;
 const GRID_SCROLL_MAX: f32 = 12.0;
 const GRID_SCROLL_RAMP: std::time::Duration = std::time::Duration::from_millis(1500);
 const GRID_SCROLL_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What stays put when the grid layout changes (zoom, resize).
+#[derive(Clone, Copy, Debug)]
+struct ScrollAnchor {
+    anchor: grid::GridAnchor,
+    /// Where in the view the anchor sits: 0 = top edge, 1 = bottom edge. It follows the scroll
+    /// position (top of the list -> top edge, end of the list -> bottom edge, middle -> middle),
+    /// so the ends of the list stay the ends and the middle stays centered.
+    view_fraction: f32,
+    /// Scrolled to the very end: stay at the very end.
+    at_end: bool,
+    /// Scroll offset at which the anchor was recorded; another offset means the user scrolled.
+    offset: f32,
+}
+
+fn pick_grid_anchor(layout: &GridLayout, offset: f32, view_height: f32) -> Option<ScrollAnchor> {
+    let max = (layout.total_height - view_height).max(0.0);
+    let view_fraction = if max > 0.0 {
+        (offset / max).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let anchor = layout.anchor_at(
+        layout.metrics.width / 2.0,
+        offset + view_fraction * view_height,
+    )?;
+    Some(ScrollAnchor {
+        anchor,
+        view_fraction,
+        at_end: max > 0.0 && offset >= max - 1.0,
+        offset,
+    })
+}
+
+/// Small "Kept" pill whose top-right corner is at `top_right`; returns its rectangle.
+fn paint_kept_badge(ui: &egui::Ui, top_right: egui::Pos2) -> egui::Rect {
+    let visuals = &ui.visuals().widgets.inactive;
+    let text = ui.painter().layout_no_wrap(
+        "Kept".into(),
+        egui::FontId::proportional(10.0),
+        visuals.fg_stroke.color,
+    );
+    let padding = egui::vec2(5.0, 2.0);
+    let size = text.size() + padding * 2.0;
+    let rect = egui::Rect::from_min_size(egui::pos2(top_right.x - size.x, top_right.y), size);
+    ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    ui.painter()
+        .galley(rect.min + padding, text, visuals.fg_stroke.color);
+    rect
+}
 
 /// Scroll acceleration: the longer a scroll gesture lasts, the faster it gets.
 #[derive(Default)]
@@ -82,6 +153,8 @@ impl ScrollBoost {
         }
     }
 }
+/// Background behind (and around) the grid photos.
+const GRID_PHOTO_BACKGROUND: egui::Color32 = egui::Color32::BLACK;
 const GRID_VISIBLE_PRIORITY: u8 = 50;
 const GRID_NEAR_PRIORITY: u8 = 30;
 const DATETIME_WORKERS: usize = 3;
@@ -319,6 +392,9 @@ struct SorterApp {
     grid_layout: Option<GridLayout>,
     grid_window: (usize, usize),
     grid_last_offset: f32,
+    grid_view_height: f32,
+    /// Photo kept in place while zooming (see `pick_grid_anchor`).
+    grid_anchor: Option<ScrollAnchor>,
     grid_scroll_down: bool,
     grid_prefetch_at: std::time::Instant,
     datetime_receiver: Receiver<DatetimeBatch>,
@@ -432,6 +508,8 @@ impl Default for SorterApp {
             grid_layout: None,
             grid_window: (usize::MAX, usize::MAX),
             grid_last_offset: 0.0,
+            grid_view_height: 0.0,
+            grid_anchor: None,
             grid_scroll_down: true,
             grid_prefetch_at: std::time::Instant::now(),
             datetime_receiver,
@@ -816,7 +894,7 @@ fn apply_exif_orientation(image: image::DynamicImage, orientation: u32) -> image
     }
 }
 
-fn embedded_thumbnail(exif: &exif::Exif, orientation: u32) -> Option<ColorImage> {
+fn embedded_thumbnail(exif: &exif::Exif, orientation: u32, size: (u32, u32)) -> Option<ColorImage> {
     let offset = exif
         .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
         .value
@@ -828,7 +906,7 @@ fn embedded_thumbnail(exif: &exif::Exif, orientation: u32) -> Option<ColorImage>
     let end = offset.checked_add(length)?;
     let jpeg = exif.buf().get(offset..end)?;
     let image = apply_exif_orientation(
-        decode_jpeg(std::io::Cursor::new(jpeg), Some((320, 320)))?,
+        decode_jpeg(std::io::Cursor::new(jpeg), Some((size.0, size.0)))?,
         orientation,
     )
     .to_rgba8();
@@ -1647,7 +1725,7 @@ fn preview_worker(
         let outcome = if job.deadline <= std::time::Instant::now() {
             PreviewOutcome::Expired
         } else {
-            let cacheable = job.size == VIEW_PREVIEW;
+            let cacheable = is_thumb(job.size);
             let cached = if cacheable {
                 read_cached_preview(&cache, &actual_key)
             } else {
@@ -1676,13 +1754,13 @@ fn preview_worker(
     }
 }
 
-fn system_thumbnail(path: &Path) -> Option<ColorImage> {
+fn system_thumbnail(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("thumbnails");
-    system_thumbnail_at(path, &cache)
+    system_thumbnail_at(path, &cache, size)
 }
 
 fn png_text_matches(data: &[u8], wanted_key: &str, wanted_value: &str) -> bool {
@@ -1716,11 +1794,11 @@ fn png_text_matches(data: &[u8], wanted_key: &str, wanted_value: &str) -> bool {
     false
 }
 
-fn system_thumbnail_at(path: &Path, cache: &Path) -> Option<ColorImage> {
+fn system_thumbnail_at(path: &Path, cache: &Path, size: (u32, u32)) -> Option<ColorImage> {
     let uri = Url::from_file_path(path).ok()?.to_string();
     let name = format!("{:x}.png", md5::compute(uri.as_bytes()));
-    for size in ["xx-large", "x-large", "large", "normal"] {
-        let thumbnail = cache.join(size).join(&name);
+    for folder in ["xx-large", "x-large", "large", "normal"] {
+        let thumbnail = cache.join(folder).join(&name);
         let Ok(data) = fs::read(thumbnail) else {
             continue;
         };
@@ -1744,7 +1822,7 @@ fn system_thumbnail_at(path: &Path, cache: &Path) -> Option<ColorImage> {
             continue;
         }
         if let Some(image) = decode_cached_thumbnail_png(&data) {
-            let thumbnail = image.thumbnail(320, 240).to_rgba8();
+            let thumbnail = image.thumbnail(size.0, size.1).to_rgba8();
             return Some(ColorImage::from_rgba_unmultiplied(
                 [thumbnail.width() as usize, thumbnail.height() as usize],
                 thumbnail.as_raw(),
@@ -1790,24 +1868,33 @@ fn decode_cached_thumbnail_png(data: &[u8]) -> Option<image::DynamicImage> {
     Some(image::DynamicImage::ImageRgba8(decoded))
 }
 
+/// A shortcut thumbnail (system cache, EXIF) is accepted as is for the fast size; for the HD
+/// size it must be nearly as large as requested, otherwise it would be displayed blurry.
+fn big_enough(image: &ColorImage, size: (u32, u32)) -> bool {
+    size == VIEW_PREVIEW
+        || image.size[0] as f32 >= size.0 as f32 * 0.8
+        || image.size[1] as f32 >= size.1 as f32 * 0.8
+}
+
 fn quick_preview(
     path: &Path,
     exif: Option<&exif::Exif>,
     orientation: u32,
     allow_system: bool,
+    size: (u32, u32),
 ) -> Option<ColorImage> {
     if allow_system && orientation == 1 {
-        if let Some(thumbnail) = system_thumbnail(path) {
+        if let Some(thumbnail) = system_thumbnail(path, size).filter(|t| big_enough(t, size)) {
             return Some(thumbnail);
         }
     }
-    embedded_thumbnail(exif?, orientation)
+    embedded_thumbnail(exif?, orientation, size).filter(|t| big_enough(t, size))
 }
 
 /// Decodes JPEG bytes at (at most) `size`, applying the orientation. A thumbnail request
 /// (`VIEW_PREVIEW`) is decoded straight to thumbnail size using the JPEG's DCT scaling.
 fn decode_jpeg_bytes(data: &[u8], orientation: u32, size: (u32, u32)) -> Option<image::DynamicImage> {
-    let thumbnail = size == VIEW_PREVIEW;
+    let thumbnail = is_thumb(size);
     let requested = if thumbnail {
         if matches!(orientation, 5..=8) {
             (size.1, size.0)
@@ -1852,8 +1939,8 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     if is_raw(path) && !is_rw2(path) {
         // Other RAW formats have no embedded-preview reader here: reuse the system thumbnail
         // for grid cells when there is one, otherwise develop the RAW at the requested size.
-        if size == VIEW_PREVIEW {
-            if let Some(thumbnail) = system_thumbnail(path) {
+        if is_thumb(size) {
+            if let Some(thumbnail) = system_thumbnail(path, size).filter(|t| big_enough(t, size)) {
                 return Some(thumbnail);
             }
         }
@@ -1861,7 +1948,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     }
     if is_rw2(path) {
         let embedded = rw2_embedded_jpeg(path);
-        if size != VIEW_PREVIEW {
+        if !is_thumb(size) {
             let preview_size = embedded.as_ref().and_then(|(jpeg, orientation)| {
                 jpeg_dimensions(jpeg).map(|dimensions| oriented_dimensions(dimensions, *orientation))
             });
@@ -1874,7 +1961,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
         let (jpeg, orientation) = embedded?;
         return color_image(decode_jpeg_bytes(&jpeg, orientation, size)?);
     }
-    let prefix = if size == VIEW_PREVIEW {
+    let prefix = if is_thumb(size) {
         load_prefix(path)?
     } else {
         CachedBytes {
@@ -1884,8 +1971,8 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     };
     let mut exif = parse_exif(&prefix.data);
     let mut orientation = orientation_of(exif.as_ref());
-    if size == VIEW_PREVIEW {
-        if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, true) {
+    if is_thumb(size) {
+        if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, true, size) {
             return Some(thumbnail);
         }
     }
@@ -1897,19 +1984,19 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
     if !prefix.complete && !is_jpeg(path) {
         exif = parse_exif(&data);
         orientation = orientation_of(exif.as_ref());
-        if size == VIEW_PREVIEW {
-            if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, false) {
+        if is_thumb(size) {
+            if let Some(thumbnail) = quick_preview(path, exif.as_ref(), orientation, false, size) {
                 return Some(thumbnail);
             }
         }
     }
-    let output_target = if size == VIEW_PREVIEW && matches!(orientation, 5..=8) {
+    let output_target = if is_thumb(size) && matches!(orientation, 5..=8) {
         (size.1, size.0)
     } else {
         size
     };
     let decoded = if is_jpeg(path) {
-        let requested = if size == VIEW_PREVIEW {
+        let requested = if is_thumb(size) {
             output_target
         } else {
             image_dimensions(path, &data)
@@ -1948,12 +2035,12 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
             image::DynamicImage::from_decoder(decoder).ok()?,
             orientation,
         );
-        let target = if size == VIEW_PREVIEW {
+        let target = if is_thumb(size) {
             size
         } else {
             oriented_dimensions(dimensions, orientation)
         };
-        if pixels.width() <= target.0 && pixels.height() <= target.1 && size != VIEW_PREVIEW {
+        if pixels.width() <= target.0 && pixels.height() <= target.1 && !is_thumb(size) {
             pixels
         } else {
             pixels.thumbnail(target.0, target.1)
@@ -2569,7 +2656,7 @@ impl SorterApp {
             for job in std::mem::take(&mut queue.jobs) {
                 let is_prefetch = (PREFETCH_MIN_PRIORITY..=PREFETCH_PRIORITY)
                     .contains(&job.priority)
-                    && job.size != VIEW_PREVIEW;
+                    && !is_thumb(job.size);
                 if is_prefetch && !wanted.contains(&job.key.path) {
                     queue.active.remove(&job.key);
                     removed.push(job.key);
@@ -2589,15 +2676,22 @@ impl SorterApp {
 
     /// Cancels queued grid thumbnails of photos that are no longer near the viewport.
     /// Thumbnails that were on screen but no longer are fall back to the neighbour priority.
-    fn retain_grid_thumbnails(&mut self, wanted: &HashSet<PathBuf>, visible: &HashSet<PathBuf>) {
+    fn retain_grid_thumbnails(
+        &mut self,
+        wanted: &HashSet<PathBuf>,
+        visible: &HashSet<PathBuf>,
+        preview: (u32, u32),
+    ) {
         let mut demoted = Vec::new();
         let removed = if let Ok(mut queue) = self.preview_pool.queue.lock() {
             let mut removed = Vec::new();
             let mut retained = Vec::new();
             for mut job in std::mem::take(&mut queue.jobs) {
-                let is_grid_thumbnail =
-                    job.size == VIEW_PREVIEW && job.priority < PREFETCH_MIN_PRIORITY;
-                if is_grid_thumbnail && !wanted.contains(&job.key.path) {
+                let is_grid_thumbnail = is_thumb(job.size) && job.priority < PREFETCH_MIN_PRIORITY;
+                // A job of the other thumbnail size is stale after zooming in or out.
+                if is_grid_thumbnail
+                    && (job.size != preview || !wanted.contains(&job.key.path))
+                {
                     queue.active.remove(&job.key);
                     removed.push(job.key);
                 } else {
@@ -2733,12 +2827,12 @@ impl SorterApp {
         ctx: &egui::Context,
         path: &Path,
         priority: u8,
+        size: (u32, u32),
     ) -> Option<TextureHandle> {
-        if let Some(texture) = self.viewer_texture(path, VIEW_PREVIEW) {
-            return Some(texture);
-        }
-        self.texture(ctx, path, VIEW_PREVIEW, priority);
-        None
+        // Requests `size` unless a texture at least that big exists; meanwhile the closest
+        // one already loaded (e.g. the fast thumbnail after zooming in) is displayed.
+        self.texture(ctx, path, size, priority);
+        self.viewer_texture(path, size)
     }
 
     fn source_size(&mut self, ctx: &egui::Context, path: &Path) -> (u32, u32) {
@@ -3284,43 +3378,99 @@ impl SorterApp {
             let factor = self.scroll_boost.factor(std::time::Instant::now(), raw);
             ui.input_mut(|input| input.smooth_scroll_delta.y *= factor);
         }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_viewport(ui, |ui, viewport| {
-                let width = ui.available_width();
-                let metrics = GridMetrics {
-                    width,
-                    gap_x: spacing.x,
-                    gap_y: spacing.y,
-                    name_height: name_height + 2.0,
-                    date_height: date_height + 2.0,
-                    header_height: 8.0 + title_height + spacing.y * 2.0 + 1.0,
-                    min_cell: self.settings.grid_cell_size,
-                };
-                let mut layout = match self.grid_layout.take() {
-                    Some(layout)
-                        if layout.matches(
-                            self.photos_version,
-                            &metrics,
-                            show_filenames,
-                            show_datetime,
-                        ) =>
-                    {
-                        layout
+        // The layout is built before the scroll area so that, when it changes (zoom, resize),
+        // the scroll offset can be corrected in the very same frame: what was at the center of
+        // the view stays at the center.
+        // A floating scroll bar is drawn over the content (hiding the last column): use a
+        // solid one and keep its width out of the layout.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        let scroll_id = ui.make_persistent_id(egui::Id::new("grid_scroll"));
+        let scroll_state = egui::scroll_area::State::load(ctx, scroll_id);
+        let width = ui.available_width() - ui.spacing().scroll.allocated_width();
+        let metrics = GridMetrics {
+            width,
+            gap_x: spacing.x,
+            gap_y: spacing.y,
+            name_height: name_height + 2.0,
+            date_height: date_height + 2.0,
+            header_height: 8.0 + title_height + spacing.y * 2.0 + 1.0,
+            min_cell: self.settings.grid_cell_size,
+        };
+        let mut forced_offset = None;
+        let offset_now = scroll_state.map(|state| state.offset.y);
+        let view_height = self.grid_view_height;
+        let mut layout = match self.grid_layout.take() {
+            Some(layout)
+                if layout.matches(
+                    self.photos_version,
+                    &metrics,
+                    show_filenames,
+                    show_datetime,
+                ) =>
+            {
+                // Same layout: follow the user's scrolling, so the anchor is always what is
+                // in the view when a zoom starts.
+                if let Some(now) = offset_now.filter(|_| view_height > 0.0) {
+                    let stale = self
+                        .grid_anchor
+                        .is_none_or(|anchor| (anchor.offset - now).abs() >= 1.0);
+                    if stale {
+                        self.grid_anchor = pick_grid_anchor(&layout, now, view_height);
                     }
-                    _ => {
-                        let groups = group_ranges(&self.photos, |photo| &photo.subfolder);
-                        GridLayout::build(
-                            &groups,
-                            self.photos.len(),
-                            self.photos_version,
-                            metrics,
-                            show_filenames,
-                            show_datetime,
-                        )
+                }
+                layout
+            }
+            old => {
+                let groups = group_ranges(&self.photos, |photo| &photo.subfolder);
+                let layout = GridLayout::build(
+                    &groups,
+                    self.photos.len(),
+                    self.photos_version,
+                    metrics,
+                    show_filenames,
+                    show_datetime,
+                );
+                let usable = old
+                    .as_ref()
+                    .is_some_and(|old| old.photos_version == self.photos_version)
+                    && !self.scroll_to_selection
+                    && view_height > 0.0;
+                match (old, offset_now) {
+                    (Some(old), Some(now)) if usable => {
+                        // The anchor survives every step of a zoom: re-deriving it from each
+                        // intermediate layout would make it drift to another photo.
+                        let anchor = match self.grid_anchor {
+                            Some(anchor) if (anchor.offset - now).abs() < 1.0 => Some(anchor),
+                            _ => pick_grid_anchor(&old, now, view_height),
+                        };
+                        forced_offset = anchor.and_then(|mut anchor| {
+                            let max = (layout.total_height - view_height).max(0.0);
+                            let offset = if anchor.at_end {
+                                max
+                            } else {
+                                let y = layout.anchor_y(anchor.anchor)?;
+                                (y - anchor.view_fraction * view_height).clamp(0.0, max)
+                            };
+                            anchor.offset = offset;
+                            self.grid_anchor = Some(anchor);
+                            Some(offset)
+                        });
                     }
-                };
-                self.grid_columns = layout.columns;
+                    _ => self.grid_anchor = None,
+                }
+                layout
+            }
+        };
+        self.grid_columns = layout.columns;
+        let preview = grid_preview_size(layout.cell_width, ctx.pixels_per_point());
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt("grid_scroll")
+            .auto_shrink([false, false]);
+        if let Some(offset) = forced_offset {
+            area = area.vertical_scroll_offset(offset);
+        }
+        area.show_viewport(ui, |ui, viewport| {
+                self.grid_view_height = viewport.height();
                 let origin = ui.cursor().min;
                 ui.allocate_exact_size(
                     egui::vec2(width, layout.total_height),
@@ -3404,24 +3554,23 @@ impl SorterApp {
                         );
                         let path = self.photos[photo_index].display.clone();
                         let kept = self.photos[photo_index].kept;
-                        let texture = self.grid_thumbnail(ctx, &path, GRID_VISIBLE_PRIORITY);
+                        let texture = self.grid_thumbnail(ctx, &path, GRID_VISIBLE_PRIORITY, preview);
                         let selected = self.selection.contains(&photo_index);
                         let mut text_top = top;
                         let painter = ui.painter();
+                        // Text rows keep the app background; dark grey behind the photo.
+                        painter.rect_filled(thumb_rect, 0.0, GRID_PHOTO_BACKGROUND);
+                        if kept && !show_filenames {
+                            // No filename on that row: the badge sits alone above the photo.
+                            paint_kept_badge(ui, egui::pos2(cell_rect.right(), top));
+                        }
                         if show_filenames {
                             let kept_width = if kept {
-                                let galley = painter.layout_no_wrap(
-                                    "Kept".into(),
-                                    name_font.clone(),
-                                    text_color,
+                                let badge = paint_kept_badge(
+                                    ui,
+                                    egui::pos2(cell_rect.right(), text_top),
                                 );
-                                let kept_width = galley.size().x;
-                                painter.galley(
-                                    egui::pos2(cell_rect.right() - kept_width, text_top),
-                                    galley,
-                                    text_color,
-                                );
-                                kept_width + spacing.x
+                                badge.width() + spacing.x
                             } else {
                                 0.0
                             };
@@ -3468,8 +3617,7 @@ impl SorterApp {
                                 egui::Color32::WHITE,
                             );
                         } else {
-                            painter.rect_filled(thumb_rect, 2.0, egui::Color32::from_gray(48));
-                            let key = self.cached_texture_key(&path, VIEW_PREVIEW);
+                            let key = self.cached_texture_key(&path, preview);
                             if self.failed_textures.contains(&key) {
                                 ui.painter().text(
                                     thumb_rect.center(),
@@ -3503,7 +3651,7 @@ impl SorterApp {
                         }
                     }
                 }
-                self.stream_grid_neighbours(ctx, &layout, visible, viewport.height());
+                self.stream_grid_neighbours(ctx, &layout, visible, viewport.height(), preview);
                 self.grid_layout = Some(layout);
             });
         clicked
@@ -3517,6 +3665,7 @@ impl SorterApp {
         layout: &GridLayout,
         visible: std::ops::Range<usize>,
         viewport_height: f32,
+        preview: (u32, u32),
     ) {
         if layout.items.is_empty() {
             return;
@@ -3550,6 +3699,11 @@ impl SorterApp {
         } else {
             (visible.end..near.end).collect()
         };
+        let prefetch_limit = if preview == GRID_HD_PREVIEW {
+            GRID_HD_PREFETCH_LIMIT
+        } else {
+            GRID_PREFETCH_LIMIT
+        };
         let mut wanted: HashSet<PathBuf> = HashSet::new();
         let mut on_screen: HashSet<PathBuf> = HashSet::new();
         let mut dates: Vec<PathBuf> = Vec::new();
@@ -3566,7 +3720,7 @@ impl SorterApp {
                     continue;
                 }
                 for photo in &self.photos[item.start..item.end] {
-                    if wanted.len() >= GRID_PREFETCH_LIMIT {
+                    if wanted.len() >= prefetch_limit {
                         break 'collect;
                     }
                     wanted.insert(photo.display.clone());
@@ -3581,10 +3735,10 @@ impl SorterApp {
             }
         }
         if window_changed {
-            self.retain_grid_thumbnails(&wanted, &on_screen);
+            self.retain_grid_thumbnails(&wanted, &on_screen, preview);
         }
         for (path, priority) in requests {
-            self.grid_thumbnail(ctx, &path, priority);
+            self.grid_thumbnail(ctx, &path, priority, preview);
         }
         if !dates.is_empty() {
             self.prioritize_datetimes(dates);
@@ -4816,10 +4970,10 @@ mod tests {
         writer.write_image_data(thumbnail.as_raw()).unwrap();
         drop(writer);
         assert_eq!(
-            system_thumbnail_at(&source, &root.join("thumbnails"))
+            system_thumbnail_at(&source, &root.join("thumbnails"), VIEW_PREVIEW)
                 .unwrap()
                 .size,
-            [320, 240]
+            [VIEW_PREVIEW.0 as usize, VIEW_PREVIEW.1 as usize]
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 pub const GRID_MIN_CELL: f32 = 80.0;
-/// Thumbnails are decoded at 320x240: larger cells would only show upscaled pixels.
+/// Thumbnails are decoded at 640x480 to keep them sharp at the largest grid size.
 pub const GRID_MAX_CELL: f32 = 320.0;
 pub const GRID_DEFAULT_CELL: f32 = 160.0;
+/// Empty space below the photo of every cell (on top of the gap between rows).
+pub const GRID_CELL_MARGIN: f32 = 6.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridItemKind {
@@ -39,6 +41,14 @@ pub struct GridMetrics {
     pub header_height: f32,
     /// Wanted minimum width of a cell: the slider of the toolbar.
     pub min_cell: f32,
+}
+
+/// A photo (or a folder title) and the relative position inside its item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridAnchor {
+    pub photo: usize,
+    pub header: bool,
+    pub fraction: f32,
 }
 
 pub struct GridLayout {
@@ -92,7 +102,7 @@ impl GridLayout {
             .floor()
             .max(1.0) as usize;
         let cell_width =
-            ((metrics.width - metrics.gap_x * (columns - 1) as f32) / columns as f32).max(100.0);
+            ((metrics.width - metrics.gap_x * (columns - 1) as f32) / columns as f32).max(1.0);
         let mut text_height = 0.0;
         if show_filenames {
             text_height += metrics.name_height;
@@ -100,8 +110,10 @@ impl GridLayout {
         if show_datetime {
             text_height += metrics.date_height;
         }
+        // The "Kept" badge always needs a row above the photo, as tall as a filename row.
+        text_height = text_height.max(metrics.name_height);
         let thumb_height = cell_width * 0.75;
-        let cell_height = text_height + thumb_height;
+        let cell_height = text_height + thumb_height + GRID_CELL_MARGIN;
         let mut items = Vec::with_capacity(groups.len() + photo_count / columns + 1);
         let mut photo_item = vec![0u32; photo_count];
         let mut top = 0.0_f32;
@@ -146,6 +158,40 @@ impl GridLayout {
             cell_height,
             ranges: HashMap::new(),
         }
+    }
+
+    /// What is at `(x, y)` (content coordinates): survives a change of layout, so the view can
+    /// stay centered on the same photo after zooming or resizing.
+    pub fn anchor_at(&self, x: f32, y: f32) -> Option<GridAnchor> {
+        if self.items.is_empty() {
+            return None;
+        }
+        let index = self
+            .items
+            .partition_point(|item| item.top + item.height < y)
+            .min(self.items.len() - 1);
+        let item = self.items[index];
+        let fraction = ((y - item.top) / item.height.max(1.0)).clamp(0.0, 1.0);
+        let photo = match item.kind {
+            GridItemKind::Header => item.start,
+            GridItemKind::Row => {
+                let column = (x / (self.cell_width + self.metrics.gap_x)).max(0.0) as usize;
+                item.start + column.min(item.end - item.start - 1)
+            }
+        };
+        Some(GridAnchor {
+            photo,
+            header: item.kind == GridItemKind::Header,
+            fraction,
+        })
+    }
+
+    /// Vertical position (content coordinates) of `anchor` in this layout.
+    pub fn anchor_y(&self, anchor: GridAnchor) -> Option<f32> {
+        let row = *self.photo_item.get(anchor.photo)? as usize;
+        let index = if anchor.header { row.checked_sub(1)? } else { row };
+        let item = self.items.get(index)?;
+        Some(item.top + anchor.fraction * item.height)
     }
 
     /// Items intersecting the vertical span `y_min..=y_max` (content coordinates).
@@ -227,6 +273,54 @@ mod tests {
             GridLayout::build(&[(0, 10)], 10, 1, GridMetrics { min_cell: 9999.0, ..metrics(1000.0) }, true, true).columns,
             3
         );
+    }
+
+    #[test]
+    fn anchor_keeps_the_central_photo_when_the_layout_changes() {
+        let groups = [(0, 40)];
+        let small = GridLayout::build(&groups, 40, 1, metrics(1000.0), true, true);
+        let big = GridLayout::build(
+            &groups,
+            40,
+            1,
+            GridMetrics { min_cell: 320.0, ..metrics(1000.0) },
+            true,
+            true,
+        );
+        // Middle of the second row of the small layout.
+        let row = small.items[2];
+        let y = row.top + row.height / 2.0;
+        let anchor = small.anchor_at(500.0, y).unwrap();
+        assert!(!anchor.header);
+        assert_eq!(small.photo_item[anchor.photo], 2);
+        let new_y = big.anchor_y(anchor).unwrap();
+        let item = big.items[big.photo_item[anchor.photo] as usize];
+        assert!(new_y >= item.top && new_y <= item.top + item.height);
+        assert!((anchor.fraction - 0.5).abs() < 0.01);
+        let header = small.anchor_at(0.0, 1.0).unwrap();
+        assert!(header.header && header.photo == 0);
+        assert!((big.anchor_y(header).unwrap() - 0.0).abs() < 41.0);
+    }
+
+    #[test]
+    fn rows_never_exceed_the_available_width() {
+        for width in [150.0_f32, 333.0, 640.0, 999.5, 1517.0, 2560.0] {
+            let mut min_cell = GRID_MIN_CELL;
+            while min_cell <= GRID_MAX_CELL {
+                let layout = GridLayout::build(
+                    &[(0, 50)],
+                    50,
+                    1,
+                    GridMetrics { min_cell, ..metrics(width) },
+                    true,
+                    true,
+                );
+                let used = layout.columns as f32 * layout.cell_width
+                    + (layout.columns - 1) as f32 * 8.0;
+                assert!(used <= width + 0.01, "width {width}, cell {min_cell}: {used}");
+                min_cell += 1.0;
+            }
+        }
     }
 
     #[test]
