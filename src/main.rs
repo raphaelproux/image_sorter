@@ -437,6 +437,10 @@ struct SorterApp {
     texture_fingerprints: HashMap<PathBuf, u64>,
     expanded_exif: HashSet<String>,
     scroll_boost: ScrollBoost,
+    viewer_right_gesture: bool,
+    viewer_right_chord: bool,
+    viewer_right_released: bool,
+    viewer_primary_down: bool,
 }
 
 impl Default for SorterApp {
@@ -551,6 +555,10 @@ impl Default for SorterApp {
             texture_fingerprints: HashMap::new(),
             expanded_exif: HashSet::new(),
             scroll_boost: ScrollBoost::default(),
+            viewer_right_gesture: false,
+            viewer_right_chord: false,
+            viewer_right_released: false,
+            viewer_primary_down: false,
         }
     }
 }
@@ -4176,7 +4184,75 @@ impl eframe::App for SorterApp {
                 let available = ui.available_size();
                 let (rect, response) =
                     ui.allocate_exact_size(available, egui::Sense::click_and_drag());
-                if response.double_clicked() {
+                let pointer_events = ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed,
+                                ..
+                            } if rect.contains(*pos)
+                                || ((self.viewer_right_gesture
+                                    || (button == &PointerButton::Primary
+                                        && !pressed
+                                        && self.viewer_primary_down))
+                                    && matches!(button, PointerButton::Primary | PointerButton::Secondary)) =>
+                            {
+                                Some((*pos, *button, *pressed))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let mut right_chord_completed = false;
+                for (pos, button, pressed) in pointer_events {
+                    match (button, pressed) {
+                        (PointerButton::Secondary, true) if rect.contains(pos) => {
+                            self.viewer_right_gesture = true;
+                            self.viewer_right_chord = self.viewer_primary_down;
+                            self.viewer_right_released = false;
+                        }
+                        (PointerButton::Primary, true) if rect.contains(pos) => {
+                            self.viewer_primary_down = true;
+                            if self.viewer_right_gesture || self.viewer_right_released {
+                                self.viewer_right_chord = true;
+                            }
+                        }
+                        (PointerButton::Primary, false) if self.viewer_primary_down => {
+                            self.viewer_primary_down = false;
+                            if self.viewer_right_released {
+                                if self.viewer_right_chord {
+                                    self.previous_photo();
+                                    right_chord_completed = true;
+                                } else {
+                                    self.next_photo();
+                                }
+                                self.viewer_right_gesture = false;
+                                self.viewer_right_chord = false;
+                                self.viewer_right_released = false;
+                            }
+                        }
+                        (PointerButton::Secondary, false) if self.viewer_right_gesture => {
+                            self.viewer_right_released = true;
+                            if !self.viewer_primary_down {
+                                if self.viewer_right_chord {
+                                    self.previous_photo();
+                                    right_chord_completed = true;
+                                } else {
+                                    self.next_photo();
+                                }
+                                self.viewer_right_gesture = false;
+                                self.viewer_right_chord = false;
+                                self.viewer_right_released = false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if response.double_clicked() && !right_chord_completed && !self.viewer_right_chord {
                     self.show_grid();
                 }
                 if response.middle_clicked() {
