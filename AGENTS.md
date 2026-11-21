@@ -19,7 +19,7 @@ Rust (egui/eframe) Linux GUI image sorter (target: Solus OS). Features: recursiv
 
 ## Architecture
 - Background threads: folder scan, keep-folder scan, file operations (keep = copy, delete = move to the configured delete folder preserving the relative path; history kept for undo).
-- Prioritized preview worker pool (`PreviewPool`, `TextureKey{path,width,height,fingerprint}`). `VIEW_PREVIEW=(320,240)`; viewer requests sized via `viewer_request_size`; JPEGs decoded with jpeg_decoder `scale`.
+- Prioritized preview worker pool (`PreviewPool`, `TextureKey{path,width,height,fingerprint}`). `VIEW_PREVIEW=(320,240)`; viewer requests sized via `viewer_request_size` (see "Thumbnail resolution"); JPEGs decoded with jpeg_decoder `scale`.
 - Thumbnails: freedesktop cache (validated by URI/MTime/Size), embedded EXIF thumbnail, own zlib disk cache (only for 320x240).
 - Settings (`Settings`, serde default) saved to `$XDG_CONFIG_HOME/image_sorter/settings.json`: keep_folder, delete_folder, shortcuts, `show_exif`, `show_datetime` (default true), `show_filenames` (default true; toolbar checkbox hides filenames in grid cells and the viewer title bar). Settings live in an `egui::Modal`; a missing keep/delete folder opens the modal with a `pending_action`.
 - Kept status is reconciled by scanning the keep folder (`scan_keep_folder`, `is_kept`, `refresh_kept_status`, `poll_kept_status`, about every 3s as a fallback). A `notify` watcher on the keep folder (`sync_keep_watcher`, `keep_dirty` flag) triggers a rescan ~300ms after any file is added, removed or renamed there.
@@ -73,3 +73,8 @@ All requested features are implemented. Latest round (all done, `cargo check` an
 ## Known caveats / possible follow-ups
 - Photos without any EXIF data are re-read each frame while `show_exif` is on and `exif` is empty (cheap failure, but could be guarded with a "loaded" flag).
 - Optionally build a fuller tag ID -> name table from `EXIF Tags.html` if kamadak-exif names are insufficient (many MakerNote/unknown tags show as "Unknown EXIF tag 0xXXXX" and fall in "Others").
+
+## Thumbnail resolution
+- Grid tiers `GRID_TIERS` (160x120 ... 1920x1440, 4:3 boxes). `grid_preview_size(cell_width, pixels_per_point)` picks the smallest tier that enlarges the cell by at most `MAX_UPSCALE` (5%), i.e. it follows the physical pixels the cell covers. A tier change resets `grid_window` so prefetch is redone; `grid_prefetch_limit(tier)` caps the prefetch by a memory budget.
+- `TextureEntry.generated_size` is the real size of the pixels. `enlargement(generated, box)` (limiting axis) is the single sharpness measure; `resolution_satisfies` = enlargement <= `MAX_UPSCALE`. `entry_serves` decides reuse: an entry made for exactly the requested key is final (source smaller than the box), otherwise it must be sharp and, for grid tiers, not more than `GRID_MAX_OVERSIZE` too big. `viewer_texture` prefers the smallest sharp texture, else the sharpest one (fallback while the better one loads).
+- Decoders never enlarge thumbnails (`system_thumbnail_at`, generic decoder), and the rotated-orientation box is no longer swapped for tiers. Shortcut thumbnails (system cache/EXIF) go through `big_enough`. Disk cache files carry `PREVIEW_CACHE_VERSION` in their name: bump it when generation rules change.

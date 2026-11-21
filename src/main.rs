@@ -33,27 +33,62 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "tif", "
 const MAX_TEXTURE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TEXTURE_MEMORY: usize = 512 * 1024 * 1024;
 const VIEW_PREVIEW: (u32, u32) = (320, 240);
-/// Sharper grid thumbnails, only requested when the cells are large (see `grid_preview_size`).
-const GRID_HD_PREVIEW: (u32, u32) = (640, 480);
-/// Cell width (physical pixels) beyond which the fast 320x240 thumbnails would be upscaled.
-const GRID_HD_CELL_PIXELS: f32 = 320.0;
-/// Fewer thumbnails are prefetched in HD: they are four times as big in memory.
-const GRID_HD_PREFETCH_LIMIT: usize = 120;
+/// Grid thumbnail tiers (4:3 boxes). The tier is derived from the physical pixels a cell really
+/// covers on screen (`grid_preview_size`), so a thumbnail is never stretched by much.
+const GRID_TIERS: [(u32, u32); 6] = [
+    (160, 120),
+    VIEW_PREVIEW,
+    (640, 480),
+    (960, 720),
+    (1280, 960),
+    (1920, 1440),
+];
+/// Largest enlargement accepted for a texture on screen (1.05 = 5%): anything blurrier than
+/// that is regenerated at a higher resolution.
+const MAX_UPSCALE: f32 = 1.05;
+/// A grid texture more than this many times larger than needed is replaced by a closer tier
+/// (a big texture squeezed into a small cell shimmers).
+const GRID_MAX_OVERSIZE: f32 = 2.0;
+/// Memory budget of the grid thumbnails kept ready around the viewport (bigger tiers mean
+/// fewer prefetched thumbnails).
+const GRID_PREFETCH_BYTES: usize = 160 * 1024 * 1024;
+/// Bump to ignore the thumbnails cached on disk by an older, less strict generator.
+const PREVIEW_CACHE_VERSION: u8 = 3;
 
-/// The two thumbnail sizes: decoded through the fast path (cache, embedded thumbnails).
+/// The thumbnail tiers: decoded through the fast path (cache, embedded thumbnails).
 fn is_thumb(size: (u32, u32)) -> bool {
-    size == VIEW_PREVIEW || size == GRID_HD_PREVIEW
+    GRID_TIERS.contains(&size)
 }
 
-/// Fast thumbnails while zoomed out, HD ones once a cell has more than `GRID_HD_CELL_PIXELS`
-/// physical pixels of width.
+/// Smallest tier that covers a cell of `cell_width` points without enlarging it by more than
+/// `MAX_UPSCALE`, given the physical pixels per point of the screen.
 fn grid_preview_size(cell_width: f32, pixels_per_point: f32) -> (u32, u32) {
-    if cell_width * pixels_per_point > GRID_HD_CELL_PIXELS {
-        GRID_HD_PREVIEW
-    } else {
-        VIEW_PREVIEW
-    }
+    let needed = cell_width * pixels_per_point;
+    GRID_TIERS
+        .iter()
+        .copied()
+        .find(|tier| tier.0 as f32 * MAX_UPSCALE >= needed)
+        .unwrap_or(GRID_TIERS[GRID_TIERS.len() - 1])
 }
+
+fn grid_prefetch_limit(tier: (u32, u32)) -> usize {
+    (GRID_PREFETCH_BYTES / (tier.0 as usize * tier.1 as usize * 4)).clamp(16, GRID_PREFETCH_LIMIT)
+}
+
+/// How much an image of size `generated` must be enlarged to fill the box `requested`:
+/// 1.0 fills it exactly, above 1.0 it is too small (blurry), below 1.0 it has spare pixels.
+/// Judged on the limiting axis, so wide and tall photos are not penalised for their shape.
+fn enlargement(generated: (u32, u32), requested: (u32, u32)) -> f32 {
+    if generated.0 == 0 || generated.1 == 0 {
+        return f32::INFINITY;
+    }
+    (requested.0 as f32 / generated.0 as f32).min(requested.1 as f32 / generated.1 as f32)
+}
+
+fn resolution_satisfies(generated: (u32, u32), requested: (u32, u32)) -> bool {
+    requested.0 > 0 && requested.1 > 0 && enlargement(generated, requested) <= MAX_UPSCALE
+}
+
 const ACTIVE_VIEW_PREVIEW_PRIORITY: u8 = 250;
 /// Jobs at or above this priority belong to the photo on screen (the others are grid thumbnails
 /// and neighbours prefetched in the background).
@@ -186,10 +221,18 @@ enum ActionKind {
     Delete,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileUndo {
+    RemoveCreated,
+    RestoreMoved,
+    RestoreRemovedKeep,
+}
+
 #[derive(Clone, Debug)]
 struct FileMove {
     original: PathBuf,
     destination: PathBuf,
+    undo: FileUndo,
 }
 
 #[derive(Clone, Debug)]
@@ -197,7 +240,9 @@ struct HistoryEntry {
     kind: ActionKind,
     files: Vec<FileMove>,
     photos: Vec<Photo>,
-    kept_before: HashSet<PathBuf>,
+    kept_before: HashMap<PathBuf, bool>,
+    kept_after: HashMap<PathBuf, bool>,
+    stash_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -216,6 +261,7 @@ enum PreviewOutcome {
 
 struct TextureEntry {
     key: TextureKey,
+    generated_size: (u32, u32),
     handle: TextureHandle,
     bytes: usize,
     last_used: u64,
@@ -396,6 +442,8 @@ struct SorterApp {
     dates_version: u64,
     grid_layout: Option<GridLayout>,
     grid_window: (usize, usize),
+    /// Thumbnail tier the grid last asked for (a change forces a prefetch refresh).
+    grid_tier: (u32, u32),
     grid_last_offset: f32,
     grid_view_height: f32,
     /// Photo kept in place while zooming (see `pick_grid_anchor`).
@@ -517,6 +565,7 @@ impl Default for SorterApp {
             dates_version: 0,
             grid_layout: None,
             grid_window: (usize::MAX, usize::MAX),
+            grid_tier: VIEW_PREVIEW,
             grid_last_offset: 0.0,
             grid_view_height: 0.0,
             grid_anchor: None,
@@ -1294,6 +1343,149 @@ fn suffixed_name(name: &Path, suffix: u32) -> PathBuf {
     })
 }
 
+fn process_keep_files(
+    destination: PathBuf,
+    photo_files: Vec<(PathBuf, Vec<PathBuf>)>,
+    mut history: HistoryEntry,
+    sender: Sender<OperationMessage>,
+) -> OperationResult {
+    let keep_files = scan_keep_folder(&destination);
+    let keep_entries: Vec<PathBuf> = WalkDir::new(&destination)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect();
+    let stash = std::env::temp_dir().join(format!(
+        "image_sorter_undo_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut completed = HashSet::new();
+    let mut errors = Vec::new();
+    let mut claimed = HashSet::new();
+    let mut reserved_names = HashSet::new();
+    let total = photo_files.iter().map(|(_, group)| group.len()).sum::<usize>();
+    let mut processed = 0;
+
+    for (display, group) in &photo_files {
+        let photo = history.photos.iter().find(|photo| photo.display == *display);
+        let was_kept = photo.is_some_and(|photo| is_kept(photo, &keep_files));
+        history.kept_before.insert(display.clone(), was_kept);
+        history.kept_after.insert(display.clone(), !was_kept);
+        if was_kept {
+            let errors_before = errors.len();
+            for source in group {
+                let name = source.file_name();
+                let size = fs::metadata(source).ok().map(|metadata| metadata.len());
+                let matched = keep_entries.iter().find(|kept| {
+                    if claimed.contains(*kept) {
+                        return false;
+                    }
+                    let Some(kept_name) = kept.file_name() else {
+                        return false;
+                    };
+                    let name_matches = name.is_some_and(|name| {
+                        kept_name == name
+                            || unsuffixed_name(Path::new(kept_name))
+                                .is_some_and(|original| original.as_os_str() == name)
+                    });
+                    name_matches
+                        && size.is_some_and(|size| {
+                            fs::metadata(kept).is_ok_and(|metadata| metadata.len() == size)
+                        })
+                });
+                if let Some(kept) = matched {
+                    let stash_path = stash.join(format!("{}", history.files.len()));
+                    if let Err(error) = fs::create_dir_all(&stash) {
+                        errors.push(format!("{}: {error}", stash.display()));
+                        break;
+                    }
+                    match move_file(kept, &stash_path) {
+                        Ok(()) => {
+                            claimed.insert(kept.clone());
+                            history.files.push(FileMove {
+                                original: kept.clone(),
+                                destination: stash_path,
+                                undo: FileUndo::RestoreRemovedKeep,
+                            });
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", kept.display())),
+                    }
+                }
+                processed += 1;
+            }
+            if errors.len() == errors_before {
+                completed.extend(group.iter().cloned());
+            }
+        } else {
+            let names: Vec<_> = group.iter().filter_map(|file| file.file_name()).collect();
+            let suffix = (0u32..)
+                .find(|suffix| {
+                    names.iter().all(|name| {
+                        let candidate = suffixed_name(Path::new(name), *suffix);
+                        !destination.join(&candidate).exists() && !reserved_names.contains(&candidate)
+                    })
+                })
+                .unwrap_or(0);
+            for name in names {
+                reserved_names.insert(suffixed_name(Path::new(name), suffix));
+            }
+            let mut photo_copied = Vec::new();
+            let errors_before = errors.len();
+            for source in group {
+                if !source.exists() {
+                    processed += 1;
+                    continue;
+                }
+                let name = source.file_name().unwrap_or_default();
+                let target = destination.join(suffixed_name(Path::new(name), suffix));
+                match copy_file(source, &target) {
+                    Ok(_) => {
+                        completed.insert(source.clone());
+                        photo_copied.push(source.clone());
+                        history.files.push(FileMove {
+                            original: source.clone(),
+                            destination: target,
+                            undo: FileUndo::RemoveCreated,
+                        });
+                    }
+                    Err(error) => errors.push(format!("{}: {error}", source.display())),
+                }
+                processed += 1;
+            }
+            if errors.len() == errors_before {
+                completed.extend(photo_copied);
+            }
+        }
+        if processed % 8 == 0 || processed == total {
+            let _ = sender.send(OperationMessage::Progress(format!(
+                "Updating keep folder {processed}/{total} files…"
+            )));
+        }
+    }
+    if history
+        .files
+        .iter()
+        .any(|item| item.undo == FileUndo::RestoreRemovedKeep)
+    {
+        history.stash_directory = Some(stash);
+    }
+    OperationResult {
+        kind: ActionKind::Keep,
+        history,
+        completed,
+        photo_files,
+        errors,
+        is_undo: false,
+        restored_photos: Vec::new(),
+    }
+}
+
 fn process_files(
     kind: ActionKind,
     root: PathBuf,
@@ -1303,16 +1495,17 @@ fn process_files(
     photos: Vec<Photo>,
     sender: Sender<OperationMessage>,
 ) -> OperationResult {
-    let kept_before = photos
+    let kept_before: HashMap<_, _> = photos
         .iter()
-        .filter(|photo| photo.kept)
-        .flat_map(|photo| photo.files.iter().cloned())
+        .map(|photo| (photo.display.clone(), photo.kept))
         .collect();
     let mut history = HistoryEntry {
         kind,
         files: Vec::new(),
         photos,
         kept_before,
+        kept_after: HashMap::new(),
+        stash_directory: None,
     };
     if let Err(error) = fs::create_dir_all(&destination) {
         return OperationResult {
@@ -1342,46 +1535,17 @@ fn process_files(
             };
         }
     }
+    if kind == ActionKind::Keep {
+        return process_keep_files(destination, photo_files, history, sender);
+    }
     let total = files.len();
     let mut errors = Vec::new();
     let mut completed = HashSet::new();
-    let mut suffixes: HashMap<PathBuf, u32> = HashMap::new();
-    if kind == ActionKind::Keep {
-        let mut reserved: HashSet<PathBuf> = HashSet::new();
-        for (_, group) in &photo_files {
-            let names: Vec<&std::ffi::OsStr> = group
-                .iter()
-                .filter_map(|file| file.file_name())
-                .collect();
-            let suffix = (0u32..)
-                .find(|suffix| {
-                    names.iter().all(|name| {
-                        let candidate = destination.join(suffixed_name(Path::new(name), *suffix));
-                        !candidate.exists() && !reserved.contains(&candidate)
-                    })
-                })
-                .unwrap_or(0);
-            for name in names {
-                reserved.insert(destination.join(suffixed_name(Path::new(name), suffix)));
-            }
-            for file in group {
-                suffixes.insert(file.clone(), suffix);
-            }
-        }
-    }
     for (position, source) in files.into_iter().enumerate() {
         if !source.exists() || completed.contains(&source) {
             continue;
         }
-        let mut target = if kind == ActionKind::Keep {
-            // Kept files sit side by side; a clash is solved with a number suffix, shared by
-            // all files of a photo so that RAW and JPEG keep the same name.
-            let name = source.file_name().unwrap_or_default();
-            let suffix = suffixes.get(&source).copied().unwrap_or(0);
-            destination.join(suffixed_name(Path::new(name), suffix))
-        } else {
-            destination.join(source.strip_prefix(&root).unwrap_or(&source))
-        };
+        let mut target = destination.join(source.strip_prefix(&root).unwrap_or(&source));
         if let Some(parent) = target.parent() {
             if let Err(error) = fs::create_dir_all(parent) {
                 errors.push(format!("{}: {error}", parent.display()));
@@ -1413,16 +1577,14 @@ fn process_files(
                 suffix += 1;
             }
         }
-        let result = match kind {
-            ActionKind::Keep => copy_file(&source, &target).map(|_| ()),
-            ActionKind::Delete => move_file(&source, &target),
-        };
+        let result = move_file(&source, &target);
         match result {
             Ok(()) => {
                 completed.insert(source.clone());
                 history.files.push(FileMove {
                     original: source,
                     destination: target,
+                    undo: FileUndo::RestoreMoved,
                 });
             }
             Err(error) => errors.push(format!("{}: {error}", source.display())),
@@ -1449,6 +1611,25 @@ fn process_files(
         is_undo: false,
         restored_photos: Vec::new(),
     }
+}
+
+fn undo_history_files(entry: &HistoryEntry) -> Vec<String> {
+    let mut errors = Vec::new();
+    for item in entry.files.iter().rev() {
+        let result = match item.undo {
+            FileUndo::RemoveCreated => fs::remove_file(&item.destination),
+            FileUndo::RestoreMoved | FileUndo::RestoreRemovedKeep => {
+                if let Some(parent) = item.original.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                move_file(&item.destination, &item.original)
+            }
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", item.destination.display()));
+        }
+    }
+    errors
 }
 
 fn preview_cache_path() -> PathBuf {
@@ -1539,6 +1720,7 @@ fn texture_name(key: &TextureKey) -> String {
 
 fn cache_file(cache: &Path, key: &TextureKey) -> PathBuf {
     let mut hasher = DefaultHasher::new();
+    PREVIEW_CACHE_VERSION.hash(&mut hasher);
     key.hash(&mut hasher);
     cache.join(format!("{:016x}.rgba", hasher.finish()))
 }
@@ -1890,7 +2072,12 @@ fn system_thumbnail_at(path: &Path, cache: &Path, size: (u32, u32)) -> Option<Co
             continue;
         }
         if let Some(image) = decode_cached_thumbnail_png(&data) {
-            let thumbnail = image.thumbnail(size.0, size.1).to_rgba8();
+            let thumbnail = if image.width() > size.0 || image.height() > size.1 {
+                image.thumbnail(size.0, size.1)
+            } else {
+                image
+            }
+            .to_rgba8();
             return Some(ColorImage::from_rgba_unmultiplied(
                 [thumbnail.width() as usize, thumbnail.height() as usize],
                 thumbnail.as_raw(),
@@ -1936,12 +2123,30 @@ fn decode_cached_thumbnail_png(data: &[u8]) -> Option<image::DynamicImage> {
     Some(image::DynamicImage::ImageRgba8(decoded))
 }
 
-/// A shortcut thumbnail (system cache, EXIF) is accepted as is for the fast size; for the HD
-/// size it must be nearly as large as requested, otherwise it would be displayed blurry.
+fn generated_size(image: &ColorImage) -> (u32, u32) {
+    (image.size[0] as u32, image.size[1] as u32)
+}
+
+/// Does a loaded texture answer a request for `wanted`? A texture generated for exactly that
+/// request is final (a source smaller than the box cannot do better). Otherwise it must be
+/// sharp enough, and for grid tiers not wastefully large either.
+fn entry_serves(entry: &TextureEntry, wanted: &TextureKey) -> bool {
+    if entry.key.fingerprint != wanted.fingerprint {
+        return false;
+    }
+    if entry.key.width == wanted.width && entry.key.height == wanted.height {
+        return true;
+    }
+    let size = (wanted.width, wanted.height);
+    if !resolution_satisfies(entry.generated_size, size) {
+        return false;
+    }
+    !is_thumb(size) || enlargement(entry.generated_size, size) >= 1.0 / GRID_MAX_OVERSIZE
+}
+
+/// A shortcut thumbnail (system cache, EXIF) is only used when it is big enough for `size`.
 fn big_enough(image: &ColorImage, size: (u32, u32)) -> bool {
-    size == VIEW_PREVIEW
-        || image.size[0] as f32 >= size.0 as f32 * 0.8
-        || image.size[1] as f32 >= size.1 as f32 * 0.8
+    resolution_satisfies(generated_size(image), size)
 }
 
 fn quick_preview(
@@ -1964,11 +2169,7 @@ fn quick_preview(
 fn decode_jpeg_bytes(data: &[u8], orientation: u32, size: (u32, u32)) -> Option<image::DynamicImage> {
     let thumbnail = is_thumb(size);
     let requested = if thumbnail {
-        if matches!(orientation, 5..=8) {
-            (size.1, size.0)
-        } else {
-            size
-        }
+        size
     } else {
         jpeg_dimensions(data)
             .map(|source| oriented_dimensions(source, orientation))
@@ -2058,11 +2259,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
             }
         }
     }
-    let output_target = if is_thumb(size) && matches!(orientation, 5..=8) {
-        (size.1, size.0)
-    } else {
-        size
-    };
+    let output_target = size;
     let decoded = if is_jpeg(path) {
         let requested = if is_thumb(size) {
             output_target
@@ -2108,7 +2305,7 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
         } else {
             oriented_dimensions(dimensions, orientation)
         };
-        if pixels.width() <= target.0 && pixels.height() <= target.1 && !is_thumb(size) {
+        if pixels.width() <= target.0 && pixels.height() <= target.1 {
             pixels
         } else {
             pixels.thumbnail(target.0, target.1)
@@ -2390,7 +2587,11 @@ impl SorterApp {
             self.photos.clear();
             self.photos_changed();
             self.grid_layout = None;
-            self.history.clear();
+            for entry in self.history.drain(..) {
+                if let Some(stash) = entry.stash_directory {
+                    let _ = fs::remove_dir_all(stash);
+                }
+            }
             self.expanded_exif.clear();
             self.last_viewer_image = None;
             self.selection.clear();
@@ -2672,6 +2873,7 @@ impl SorterApp {
                     if self.photo_index.contains_key(&key.path) {
                         self.texture_fingerprints
                             .insert(key.path.clone(), key.fingerprint);
+                        let generated_size = generated_size(&image);
                         let bytes = image.width().saturating_mul(image.height()).saturating_mul(4);
                         let handle =
                             ctx.load_texture(texture_name(&key), image, TextureOptions::LINEAR);
@@ -2682,6 +2884,7 @@ impl SorterApp {
                             self.texture_bytes = self.texture_bytes.saturating_sub(removed.bytes);
                         }
                         entries.push(TextureEntry {
+                            generated_size,
                             key,
                             handle,
                             bytes,
@@ -2855,11 +3058,9 @@ impl SorterApp {
     fn texture(&mut self, ctx: &egui::Context, path: &Path, size: (u32, u32), priority: u8) {
         let key = self.cached_texture_key(path, size);
         if let Some(index) = self.textures.get(path).and_then(|entries| {
-            entries.iter().position(|existing| {
-                existing.key.fingerprint == key.fingerprint
-                    && existing.key.width >= key.width
-                    && existing.key.height >= key.height
-            })
+            entries
+                .iter()
+                .position(|existing| entry_serves(existing, &key))
         }) {
             self.touch_texture(path, index);
             return;
@@ -2892,13 +3093,9 @@ impl SorterApp {
     /// Is a texture of at least `size` loaded for `path`?
     fn has_texture(&mut self, path: &Path, size: (u32, u32)) -> bool {
         let key = self.cached_texture_key(path, size);
-        self.textures.get(path).is_some_and(|entries| {
-            entries.iter().any(|existing| {
-                existing.key.fingerprint == key.fingerprint
-                    && existing.key.width >= key.width
-                    && existing.key.height >= key.height
-            })
-        })
+        self.textures
+            .get(path)
+            .is_some_and(|entries| entries.iter().any(|existing| entry_serves(existing, &key)))
     }
 
     /// Grid thumbnail: returns it when loaded, otherwise (re)requests it with `priority`.
@@ -2934,9 +3131,19 @@ impl SorterApp {
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.key.fingerprint == fingerprint)
-            .min_by_key(|(_, entry)| {
-                entry.key.width.abs_diff(target.0) as u64
-                    + entry.key.height.abs_diff(target.1) as u64
+            .min_by(|(_, left), (_, right)| {
+                // Sharp enough first (the smallest of those), otherwise the sharpest available.
+                let rank = |entry: &TextureEntry| {
+                    let scale = enlargement(entry.generated_size, target);
+                    if scale <= MAX_UPSCALE {
+                        (0u8, -scale)
+                    } else {
+                        (1u8, scale)
+                    }
+                };
+                rank(left)
+                    .partial_cmp(&rank(right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(index, entry)| (index, entry.handle.clone()))?;
         self.touch_texture(path, index);
@@ -3088,15 +3295,8 @@ impl SorterApp {
                             }
                         } else if result.kind == ActionKind::Keep {
                             for photo in &mut self.photos {
-                                if photo.files.iter().any(|file| {
-                                    result
-                                        .history
-                                        .photos
-                                        .iter()
-                                        .any(|before| before.files.contains(file))
-                                }) {
-                                    photo.kept =
-                                        result.history.kept_before.contains(&photo.display);
+                                if let Some(kept) = result.history.kept_before.get(&photo.display) {
+                                    photo.kept = *kept;
                                 }
                             }
                         }
@@ -3106,9 +3306,17 @@ impl SorterApp {
                             format!("Undo incomplete: {}", result.errors.join("; "))
                         };
                     } else {
+                        let kept_after = result.history.kept_after.clone();
                         if !result.history.files.is_empty() {
                             self.history.push(result.history);
                             if self.history.len() > MAX_HISTORY {
+                                if let Some(expired) = self
+                                    .history
+                                    .first()
+                                    .and_then(|entry| entry.stash_directory.as_ref())
+                                {
+                                    let _ = fs::remove_dir_all(expired);
+                                }
                                 self.history.remove(0);
                             }
                         }
@@ -3117,7 +3325,7 @@ impl SorterApp {
                                 "{} file(s) {}",
                                 result.completed.len(),
                                 if result.kind == ActionKind::Keep {
-                                    "copied"
+                                    "updated"
                                 } else {
                                     "moved"
                                 }
@@ -3150,12 +3358,17 @@ impl SorterApp {
                             .iter()
                             .filter_map(|index| self.photos.get(*index))
                             .map(|photo| photo.display.clone())
-                            .filter(|display| !successful_photos.contains(display))
+                            .filter(|display| {
+                                result.kind == ActionKind::Keep
+                                    || !successful_photos.contains(display)
+                            })
                             .collect();
                         if result.kind == ActionKind::Keep {
                             for photo in &mut self.photos {
                                 if successful_photos.contains(&photo.display) {
-                                    photo.kept = true;
+                                    if let Some(kept) = kept_after.get(&photo.display) {
+                                        photo.kept = *kept;
+                                    }
                                 }
                             }
                         } else {
@@ -3180,7 +3393,7 @@ impl SorterApp {
                         let start = self.action_start.take();
                         let next = self.action_next.take();
                         let moved_on = current_display != start;
-                        let target = if moved_on {
+                        let target = if moved_on || (self.mode == ViewMode::Grid && result.kind == ActionKind::Keep) {
                             current_display.clone()
                         } else {
                             next.clone()
@@ -3222,19 +3435,10 @@ impl SorterApp {
         let sender = self.operation_sender.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let mut errors = Vec::new();
-            for item in entry.files.iter().rev() {
-                let result = match entry.kind {
-                    ActionKind::Keep => fs::remove_file(&item.destination),
-                    ActionKind::Delete => {
-                        if let Some(parent) = item.original.parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        move_file(&item.destination, &item.original)
-                    }
-                };
-                if let Err(error) = result {
-                    errors.push(format!("{}: {error}", item.destination.display()));
+            let errors = undo_history_files(&entry);
+            if errors.is_empty() {
+                if let Some(stash) = &entry.stash_directory {
+                    let _ = fs::remove_dir_all(stash);
                 }
             }
             let restored_photos = if entry.kind == ActionKind::Delete {
@@ -3361,10 +3565,7 @@ impl SorterApp {
         if self.photos.is_empty() {
             return None;
         }
-        self.anchor
-            .or_else(|| self.selection.iter().min().copied())
-            .or(Some(self.current))
-            .map(|index| index.min(self.photos.len() - 1))
+        Some(self.current.min(self.photos.len() - 1))
     }
 
     fn leave_photo(&mut self) {
@@ -3380,6 +3581,7 @@ impl SorterApp {
     }
 
     fn select(&mut self, index: usize, modifiers: Modifiers) {
+        self.current = index;
         self.column_goal = None;
         if modifiers.shift {
             if let Some(anchor) = self.anchor {
@@ -3543,6 +3745,10 @@ impl SorterApp {
         };
         self.grid_columns = layout.columns;
         let preview = grid_preview_size(layout.cell_width, ctx.pixels_per_point());
+        if preview != self.grid_tier {
+            self.grid_tier = preview;
+            self.grid_window = (usize::MAX, usize::MAX);
+        }
         let mut area = egui::ScrollArea::vertical()
             .id_salt("grid_scroll")
             .auto_shrink([false, false]);
@@ -3780,11 +3986,7 @@ impl SorterApp {
         } else {
             (visible.end..near.end).collect()
         };
-        let prefetch_limit = if preview == GRID_HD_PREVIEW {
-            GRID_HD_PREFETCH_LIMIT
-        } else {
-            GRID_PREFETCH_LIMIT
-        };
+        let prefetch_limit = grid_prefetch_limit(preview);
         let mut wanted: HashSet<PathBuf> = HashSet::new();
         let mut on_screen: HashSet<PathBuf> = HashSet::new();
         let mut dates: Vec<PathBuf> = Vec::new();
@@ -3801,7 +4003,7 @@ impl SorterApp {
                     continue;
                 }
                 for photo in &self.photos[item.start..item.end] {
-                    if wanted.len() >= prefetch_limit {
+                    if wanted.len() >= prefetch_limit && priority != GRID_VISIBLE_PRIORITY {
                         break 'collect;
                     }
                     wanted.insert(photo.display.clone());
@@ -4569,6 +4771,38 @@ mod tests {
     }
 
     #[test]
+    fn shift_arrow_moves_extend_range_from_original_anchor() {
+        let mut app = SorterApp::default();
+        app.photos = (0..6)
+            .map(|index| test_photo(&format!("{index}.jpg")))
+            .collect();
+        app.grid_columns = 4;
+        app.select(1, Modifiers::default());
+
+        for expected_cursor in 2..=5 {
+            let current = app.grid_cursor().unwrap();
+            let (target, goal) = app.grid_move(current, 1, 0);
+            app.select(target, Modifiers {
+                shift: true,
+                ..Default::default()
+            });
+            app.column_goal = goal;
+            assert_eq!(app.grid_cursor(), Some(expected_cursor));
+            assert_eq!(app.selection, (1..=expected_cursor).collect());
+        }
+
+        let current = app.grid_cursor().unwrap();
+        let (target, goal) = app.grid_move(current, -1, 0);
+        app.select(target, Modifiers {
+            shift: true,
+            ..Default::default()
+        });
+        app.column_goal = goal;
+        assert_eq!(app.grid_cursor(), Some(4));
+        assert_eq!(app.selection, (1..=4).collect());
+    }
+
+    #[test]
     fn shortcuts_match_configured_single_and_named_keys() {
         assert!(SorterApp::shortcut_matches("k", Key::K));
         assert!(SorterApp::shortcut_matches("F1", Key::F1));
@@ -4643,7 +4877,9 @@ mod tests {
             kind,
             files: Vec::new(),
             photos: Vec::new(),
-            kept_before: HashSet::new(),
+            kept_before: HashMap::new(),
+            kept_after: HashMap::new(),
+            stash_directory: None,
         };
         OperationMessage::Complete(OperationResult {
             kind,
@@ -4720,6 +4956,19 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Grid);
         assert_eq!(app.current, 3);
         assert_eq!(app.selection, HashSet::from([3]));
+
+        let mut app = setup(0);
+        app.operation_pending = true;
+        app.action_start = Some(PathBuf::from("a.jpg"));
+        app.action_next = Some(PathBuf::from("b.jpg"));
+        app.mode = ViewMode::Grid;
+        app.selection = HashSet::from([0]);
+        let message = finished_operation(ActionKind::Keep, &app.photos, &[0]);
+        app.operation_sender.send(message).unwrap();
+        app.poll_operations(&ctx);
+        assert_eq!(app.mode, ViewMode::Grid);
+        assert_eq!(app.current, 0);
+        assert_eq!(app.selection, HashSet::from([0]));
     }
 
     #[test]
@@ -5019,6 +5268,74 @@ mod tests {
     }
 
     #[test]
+    fn keep_action_toggles_a_pair_and_undo_restores_exact_kept_files() {
+        let root = std::env::temp_dir().join(format!("image_sorter_toggle_keep_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source_dir = root.join("src");
+        let keep = root.join("keep");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&keep).unwrap();
+        let jpg = source_dir.join("photo.jpg");
+        let raw = source_dir.join("photo.rw2");
+        fs::write(&jpg, b"jpeg contents").unwrap();
+        fs::write(&raw, b"raw contents").unwrap();
+        let photo = Photo {
+            display: jpg.clone(),
+            files: vec![jpg.clone(), raw.clone()],
+            subfolder: PathBuf::new(),
+            datetime: None,
+            exif: Vec::new(),
+            exif_loaded: false,
+            datetime_loaded: false,
+            kept: false,
+        };
+        let photo_files = vec![(jpg.clone(), vec![jpg.clone(), raw.clone()])];
+        let (sender, _receiver) = mpsc::channel();
+        let copied = process_files(
+            ActionKind::Keep,
+            source_dir.clone(),
+            keep.clone(),
+            vec![jpg.clone(), raw.clone()],
+            photo_files.clone(),
+            vec![photo.clone()],
+            sender.clone(),
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        let original_kept: HashSet<_> = fs::read_dir(&keep)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(original_kept.len(), 2);
+        assert!(is_kept(&photo, &scan_keep_folder(&keep)));
+
+        let mut kept_photo = photo.clone();
+        kept_photo.kept = true;
+        let removed = process_files(
+            ActionKind::Keep,
+            source_dir,
+            keep.clone(),
+            vec![jpg.clone(), raw.clone()],
+            photo_files,
+            vec![kept_photo.clone()],
+            sender,
+        );
+        assert!(removed.errors.is_empty(), "{:?}", removed.errors);
+        assert!(fs::read_dir(&keep).unwrap().next().is_none());
+        assert!(!is_kept(&kept_photo, &scan_keep_folder(&keep)));
+        assert!(undo_history_files(&removed.history).is_empty());
+        let restored_kept: HashSet<_> = fs::read_dir(&keep)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(restored_kept, original_kept);
+        assert!(is_kept(&kept_photo, &scan_keep_folder(&keep)));
+        if let Some(stash) = removed.history.stash_directory {
+            let _ = fs::remove_dir_all(stash);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scan_pairs_raw_and_jpeg_and_keeps_similar_stems_separate() {
         let root = std::env::temp_dir().join(format!("image_sorter_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -5049,13 +5366,93 @@ mod tests {
             files: vec![FileMove {
                 original: raw.display.clone(),
                 destination: PathBuf::from("deleted/other.NEF"),
+                undo: FileUndo::RestoreMoved,
             }],
             photos: vec![raw.clone()],
-            kept_before: HashSet::new(),
+            kept_before: HashMap::new(),
+            kept_after: HashMap::new(),
+            stash_directory: None,
         };
         let restored = history.photos.clone();
         assert_eq!(restored[0].display, raw.display);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grid_tier_follows_the_physical_cell_size() {
+        // Same cell, denser screen: more physical pixels, bigger tier.
+        assert_eq!(grid_preview_size(160.0, 1.0), (160, 120));
+        assert_eq!(grid_preview_size(160.0, 2.0), (320, 240));
+        assert_eq!(grid_preview_size(160.0, 2.5), (640, 480));
+        assert_eq!(grid_preview_size(320.0, 1.0), (320, 240));
+        assert_eq!(grid_preview_size(336.0, 1.0), (320, 240));
+        assert_eq!(grid_preview_size(337.0, 1.0), (640, 480));
+        assert_eq!(grid_preview_size(320.0, 2.0), (640, 480));
+        assert_eq!(grid_preview_size(320.0, 3.0), (960, 720));
+        assert_eq!(grid_preview_size(80.0, 1.0), (160, 120));
+        // Never beyond the biggest tier.
+        assert_eq!(grid_preview_size(2000.0, 2.0), (1920, 1440));
+        // The chosen tier never enlarges the cell by more than the accepted upscale.
+        for width in 80..=320 {
+            for ppp in [1.0f32, 1.25, 1.5, 2.0, 2.5, 3.0] {
+                let tier = grid_preview_size(width as f32, ppp);
+                let needed = width as f32 * ppp;
+                assert!(needed / tier.0 as f32 <= MAX_UPSCALE + 1e-4 || tier == (1920, 1440));
+            }
+        }
+        // Bigger tiers prefetch fewer thumbnails, within the memory budget.
+        assert!(grid_prefetch_limit((1280, 960)) < grid_prefetch_limit((320, 240)));
+        assert_eq!(grid_prefetch_limit((320, 240)), GRID_PREFETCH_LIMIT);
+    }
+
+    #[test]
+    fn resolution_is_judged_by_enlargement_not_by_one_axis() {
+        let hd = (640, 480);
+        // Landscape 16:9 filling the width of the box is sharp.
+        assert!(resolution_satisfies((640, 360), hd));
+        // A fast 320x240 thumbnail stretched into an HD box is blurry.
+        assert!(!resolution_satisfies((320, 240), hd));
+        // 5% short is tolerated, 10% is not.
+        assert!(resolution_satisfies((610, 458), hd));
+        assert!(!resolution_satisfies((580, 435), hd));
+        // A wide strip must reach the box width, a tall one the box height.
+        assert!(!resolution_satisfies((320, 100), hd));
+        assert!(resolution_satisfies((100, 480), hd));
+        // Degenerate sizes never pass.
+        assert!(!resolution_satisfies((0, 480), hd));
+        assert!(enlargement((320, 240), (640, 480)) > 1.9);
+        assert!(enlargement((1280, 960), (640, 480)) < 0.51);
+    }
+
+    #[test]
+    fn grid_textures_are_reused_only_when_sharp_and_not_wasteful() {
+        let ctx = egui::Context::default();
+        let path = Path::new("a.jpg");
+        let key = |size: (u32, u32)| texture_key(path, size);
+        let entry = |requested: (u32, u32), generated: (u32, u32)| TextureEntry {
+            key: key(requested),
+            generated_size: generated,
+            handle: ctx.load_texture(
+                "t",
+                ColorImage::new([1, 1], egui::Color32::BLACK),
+                TextureOptions::LINEAR,
+            ),
+            bytes: 0,
+            last_used: 0,
+        };
+        // Exactly what was requested is final, even if the source was smaller than the box.
+        assert!(entry_serves(&entry((640, 480), (400, 300)), &key((640, 480))));
+        // A fast thumbnail does not serve an HD request ...
+        assert!(!entry_serves(&entry((320, 240), (320, 240)), &key((640, 480))));
+        // ... but an HD one serves a fast request (down to 2x oversize), not a much smaller one.
+        assert!(entry_serves(&entry((640, 480), (640, 480)), &key((320, 240))));
+        assert!(!entry_serves(&entry((1280, 960), (1280, 960)), &key((320, 240))));
+        // Viewer sizes are not tiers: any sharp enough texture serves them.
+        assert!(entry_serves(&entry((1280, 960), (1280, 960)), &key((700, 500))));
+        // Another file version never serves.
+        let mut other = key((640, 480));
+        other.fingerprint ^= 1;
+        assert!(!entry_serves(&entry((640, 480), (640, 480)), &other));
     }
 
     #[test]
@@ -5085,6 +5482,11 @@ mod tests {
             [VIEW_PREVIEW.0 as usize, VIEW_PREVIEW.1 as usize]
         );
         assert_eq!(cached.pixels, preview.pixels);
+        // A cached image is returned as stored, whatever tier its key claims; adequacy is judged
+        // on the generated size when the texture is registered.
+        let hd = (640, 480);
+        let hd_preview = decode_preview(&source, hd).unwrap();
+        assert_eq!(generated_size(&hd_preview), hd);
 
         let jpeg_path = root.join("big.jpg");
         let mut jpeg_bytes = Vec::new();
@@ -5153,12 +5555,11 @@ mod tests {
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(thumbnail.as_raw()).unwrap();
         drop(writer);
-        assert_eq!(
-            system_thumbnail_at(&source, &root.join("thumbnails"), VIEW_PREVIEW)
-                .unwrap()
-                .size,
-            [VIEW_PREVIEW.0 as usize, VIEW_PREVIEW.1 as usize]
-        );
+        // A small system thumbnail is returned as is, never enlarged into a blurry big one,
+        // so `big_enough` can reject it for a larger tier.
+        let system = system_thumbnail_at(&source, &root.join("thumbnails"), VIEW_PREVIEW).unwrap();
+        assert_eq!(system.size, [32, 24]);
+        assert!(!big_enough(&system, VIEW_PREVIEW));
         fs::remove_dir_all(root).unwrap();
     }
 }
