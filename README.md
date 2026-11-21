@@ -8,7 +8,7 @@ A lightweight Linux app (Rust, egui/eframe) to explore and sort images in folder
 - RAW + JPEG pairing: files sharing the same name are treated as one photo and the JPEG is displayed. Supported formats:
   - Images: JPEG, PNG, GIF, BMP, TIFF, WebP.
   - RAW: ARW, CR2, CR3, DNG, NEF, NRW, ORF, PEF, RAF, RW2, SRW.
-- Image viewer with zoom (mouse wheel), pan (drag), and navigation between photos (right-click for next; right-click + left-click for previous).
+- Image viewer with zoom (mouse wheel), pan (drag), and navigation between photos (right-click for next; hold one mouse button and click the other for previous, repeatable to keep stepping back).
 - Sorting actions on one or several selected photos:
   - **Keep**: copies the photo (and its paired RAW) to the keep folder, keeping the relative path.
   - **Leave**: moves on to the next photo without doing anything.
@@ -27,9 +27,10 @@ A lightweight Linux app (Rust, egui/eframe) to explore and sort images in folder
 | `Backspace` | Delete (configurable) |
 | Arrow keys | Move the selection in the grid / previous and next photo in the viewer |
 | Right-click in the viewer | Next photo |
-| Right-click + left-click in the viewer | Previous photo |
+| Hold left, click right (or hold right, click left) in the viewer | Previous photo; each extra click while still holding goes back one more |
 | `Shift` + click or arrows | Extend the selection (grid) |
 | `Ctrl` + click | Add to / remove from the selection (grid) |
+| `Ctrl` + mouse wheel | Change the thumbnail size (grid), same as the Size slider |
 | Double-click, `Enter` or `Space` | Open the selected photo in the viewer (double-click also goes back to the grid) |
 | `Esc` or `Space` | Back to the grid from the viewer |
 | `Ctrl+Z` | Undo |

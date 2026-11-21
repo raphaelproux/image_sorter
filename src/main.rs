@@ -71,6 +71,15 @@ fn grid_preview_size(cell_width: f32, pixels_per_point: f32) -> (u32, u32) {
         .unwrap_or(GRID_TIERS[GRID_TIERS.len() - 1])
 }
 
+/// New thumbnail size after a Ctrl + wheel movement of `wheel` points (up = bigger): a
+/// proportional step, so the change feels the same at every size, within the slider's range.
+fn ctrl_wheel_cell_size(current: f32, wheel: f32) -> f32 {
+    if wheel == 0.0 || !wheel.is_finite() {
+        return current;
+    }
+    (current * (wheel / 500.0).exp()).clamp(GRID_MIN_CELL, GRID_MAX_CELL)
+}
+
 fn grid_prefetch_limit(tier: (u32, u32)) -> usize {
     (GRID_PREFETCH_BYTES / (tier.0 as usize * tier.1 as usize * 4)).clamp(16, GRID_PREFETCH_LIMIT)
 }
@@ -413,6 +422,73 @@ enum ViewMode {
     Viewer,
 }
 
+/// Navigation asked by a mouse gesture in the viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerNav {
+    Next,
+    Previous,
+}
+
+/// Tracks the left/right buttons over the viewer image. A right click goes to the next photo
+/// (on release); while one button is held, every press of the other goes to the previous
+/// photo at once, so holding left and clicking right repeatedly steps back photo after photo.
+#[derive(Default, Debug)]
+struct ViewerPointer {
+    left_down: bool,
+    right_down: bool,
+    /// The current right press already acted as part of a chord (no "next" on release).
+    right_chorded: bool,
+    /// A chord happened during the current left hold: no pan, no double-click.
+    left_chorded: bool,
+}
+
+impl ViewerPointer {
+    /// `inside`: the pointer is over the image (presses elsewhere are ignored; releases always
+    /// count, so a button released outside never stays stuck).
+    fn handle(&mut self, button: PointerButton, pressed: bool, inside: bool) -> Option<ViewerNav> {
+        match (button, pressed) {
+            (PointerButton::Secondary, true) if inside => {
+                self.right_down = true;
+                self.right_chorded = self.left_down;
+                if self.left_down {
+                    self.left_chorded = true;
+                    return Some(ViewerNav::Previous);
+                }
+            }
+            (PointerButton::Primary, true) if inside => {
+                self.left_down = true;
+                self.left_chorded = self.right_down;
+                if self.right_down {
+                    self.right_chorded = true;
+                    return Some(ViewerNav::Previous);
+                }
+            }
+            (PointerButton::Secondary, false) if self.right_down => {
+                self.right_down = false;
+                if !std::mem::take(&mut self.right_chorded) {
+                    return Some(ViewerNav::Next);
+                }
+            }
+            (PointerButton::Primary, false) => self.left_down = false,
+            _ => {}
+        }
+        None
+    }
+
+    /// Forgets buttons the system no longer reports as held (released while the viewer was not
+    /// handling events).
+    fn sync(&mut self, left_held: bool, right_held: bool) {
+        self.left_down &= left_held;
+        if !right_held {
+            self.right_down = false;
+            self.right_chorded = false;
+        }
+        if !self.left_down && !self.right_down {
+            self.left_chorded = false;
+        }
+    }
+}
+
 struct SorterApp {
     settings: Settings,
     settings_snapshot: Option<Settings>,
@@ -485,10 +561,7 @@ struct SorterApp {
     texture_fingerprints: HashMap<PathBuf, u64>,
     expanded_exif: HashSet<String>,
     scroll_boost: ScrollBoost,
-    viewer_right_gesture: bool,
-    viewer_right_chord: bool,
-    viewer_right_released: bool,
-    viewer_primary_down: bool,
+    viewer_pointer: ViewerPointer,
 }
 
 impl Default for SorterApp {
@@ -604,10 +677,7 @@ impl Default for SorterApp {
             texture_fingerprints: HashMap::new(),
             expanded_exif: HashSet::new(),
             scroll_boost: ScrollBoost::default(),
-            viewer_right_gesture: false,
-            viewer_right_chord: false,
-            viewer_right_released: false,
-            viewer_primary_down: false,
+            viewer_pointer: ViewerPointer::default(),
         }
     }
 }
@@ -3655,10 +3725,21 @@ impl SorterApp {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".into());
         if ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
-            // The scroll area consumes this value: scaling it only speeds up the grid.
-            let raw = ui.input(|input| input.raw_scroll_delta.y);
-            let factor = self.scroll_boost.factor(std::time::Instant::now(), raw);
-            ui.input_mut(|input| input.smooth_scroll_delta.y *= factor);
+            let (raw, ctrl) =
+                ui.input(|input| (input.raw_scroll_delta.y, input.modifiers.ctrl || input.modifiers.command));
+            if ctrl {
+                // Ctrl + wheel resizes the thumbnails (egui turns it into a zoom gesture and
+                // does not scroll, so the grid stays put while the layout is rescaled).
+                let size = ctrl_wheel_cell_size(self.settings.grid_cell_size, raw);
+                if size != self.settings.grid_cell_size {
+                    self.settings.grid_cell_size = size;
+                    self.save_settings();
+                }
+            } else {
+                // The scroll area consumes this value: scaling it only speeds up the grid.
+                let factor = self.scroll_boost.factor(std::time::Instant::now(), raw);
+                ui.input_mut(|input| input.smooth_scroll_delta.y *= factor);
+            }
         }
         // The layout is built before the scroll area so that, when it changes (zoom, resize),
         // the scroll offset can be corrected in the very same frame: what was at the center of
@@ -4031,6 +4112,9 @@ impl SorterApp {
 
 impl eframe::App for SorterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.mode != ViewMode::Viewer {
+            self.viewer_pointer = ViewerPointer::default();
+        }
         self.poll_scan(ctx);
         self.poll_kept_status(ctx);
         self.poll_textures(ctx);
@@ -4396,65 +4480,26 @@ impl eframe::App for SorterApp {
                                 button,
                                 pressed,
                                 ..
-                            } if rect.contains(*pos)
-                                || ((self.viewer_right_gesture
-                                    || (button == &PointerButton::Primary
-                                        && !pressed
-                                        && self.viewer_primary_down))
-                                    && matches!(button, PointerButton::Primary | PointerButton::Secondary)) =>
-                            {
-                                Some((*pos, *button, *pressed))
-                            }
+                            } => Some((*button, *pressed, rect.contains(*pos))),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
                 });
-                let mut right_chord_completed = false;
-                for (pos, button, pressed) in pointer_events {
-                    match (button, pressed) {
-                        (PointerButton::Secondary, true) if rect.contains(pos) => {
-                            self.viewer_right_gesture = true;
-                            self.viewer_right_chord = self.viewer_primary_down;
-                            self.viewer_right_released = false;
-                        }
-                        (PointerButton::Primary, true) if rect.contains(pos) => {
-                            self.viewer_primary_down = true;
-                            if self.viewer_right_gesture || self.viewer_right_released {
-                                self.viewer_right_chord = true;
-                            }
-                        }
-                        (PointerButton::Primary, false) if self.viewer_primary_down => {
-                            self.viewer_primary_down = false;
-                            if self.viewer_right_released {
-                                if self.viewer_right_chord {
-                                    self.previous_photo();
-                                    right_chord_completed = true;
-                                } else {
-                                    self.next_photo();
-                                }
-                                self.viewer_right_gesture = false;
-                                self.viewer_right_chord = false;
-                                self.viewer_right_released = false;
-                            }
-                        }
-                        (PointerButton::Secondary, false) if self.viewer_right_gesture => {
-                            self.viewer_right_released = true;
-                            if !self.viewer_primary_down {
-                                if self.viewer_right_chord {
-                                    self.previous_photo();
-                                    right_chord_completed = true;
-                                } else {
-                                    self.next_photo();
-                                }
-                                self.viewer_right_gesture = false;
-                                self.viewer_right_chord = false;
-                                self.viewer_right_released = false;
-                            }
-                        }
-                        _ => {}
+                for (button, pressed, inside) in pointer_events {
+                    match self.viewer_pointer.handle(button, pressed, inside) {
+                        Some(ViewerNav::Next) => self.next_photo(),
+                        Some(ViewerNav::Previous) => self.previous_photo(),
+                        None => {}
                     }
                 }
-                if response.double_clicked() && !right_chord_completed && !self.viewer_right_chord {
+                let (left_held, right_held) = ctx.input(|input| {
+                    (
+                        input.pointer.button_down(PointerButton::Primary),
+                        input.pointer.button_down(PointerButton::Secondary),
+                    )
+                });
+                self.viewer_pointer.sync(left_held, right_held);
+                if response.double_clicked() && !self.viewer_pointer.left_chorded {
                     self.show_grid();
                 }
                 if response.middle_clicked() {
@@ -4529,7 +4574,7 @@ impl eframe::App for SorterApp {
                     .min(rect.height() / requested_size.1 as f32);
                 let display_size =
                     Vec2::new(requested_size.0 as f32, requested_size.1 as f32) * fit * self.zoom;
-                if response.dragged_by(PointerButton::Primary) {
+                if response.dragged_by(PointerButton::Primary) && !self.viewer_pointer.left_chorded {
                     let delta = response.drag_delta();
                     self.pan += delta;
                     let margin = (display_size * 0.1).min(rect.size() * 0.25);
@@ -5376,6 +5421,91 @@ mod tests {
         let restored = history.photos.clone();
         assert_eq!(restored[0].display, raw.display);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn viewer_mouse_gestures_chain_previous_while_a_button_is_held() {
+        use PointerButton::{Primary as L, Secondary as R};
+        let mut mouse = ViewerPointer::default();
+        // Plain right click: next, on release.
+        assert_eq!(mouse.handle(R, true, true), None);
+        assert_eq!(mouse.handle(R, false, true), Some(ViewerNav::Next));
+        // Plain left click does nothing.
+        assert_eq!(mouse.handle(L, true, true), None);
+        assert_eq!(mouse.handle(L, false, true), None);
+
+        // Hold left, click right three times: three steps back, no "next" on any release.
+        assert_eq!(mouse.handle(L, true, true), None);
+        for _ in 0..3 {
+            assert_eq!(mouse.handle(R, true, true), Some(ViewerNav::Previous));
+            assert_eq!(mouse.handle(R, false, true), None);
+        }
+        assert!(mouse.left_chorded);
+        assert_eq!(mouse.handle(L, false, true), None);
+        mouse.sync(false, false);
+        assert!(!mouse.left_chorded);
+
+        // Hold right, click left: back at each left press, and releasing right does not go next.
+        assert_eq!(mouse.handle(R, true, true), None);
+        assert_eq!(mouse.handle(L, true, true), Some(ViewerNav::Previous));
+        assert_eq!(mouse.handle(L, false, true), None);
+        assert_eq!(mouse.handle(L, true, true), Some(ViewerNav::Previous));
+        assert_eq!(mouse.handle(L, false, true), None);
+        assert_eq!(mouse.handle(R, false, true), None);
+
+        // Left held, right pressed and released in one go, then a normal right click again.
+        assert_eq!(mouse.handle(L, true, true), None);
+        assert_eq!(mouse.handle(R, true, true), Some(ViewerNav::Previous));
+        assert_eq!(mouse.handle(L, false, true), None);
+        assert_eq!(mouse.handle(R, false, true), None);
+        assert_eq!(mouse.handle(R, true, true), None);
+        assert_eq!(mouse.handle(R, false, true), Some(ViewerNav::Next));
+    }
+
+    #[test]
+    fn viewer_mouse_ignores_presses_outside_and_never_sticks() {
+        use PointerButton::{Primary as L, Secondary as R};
+        let mut mouse = ViewerPointer::default();
+        // Presses outside the image (toolbar, EXIF panel) do nothing, even their release.
+        assert_eq!(mouse.handle(R, true, false), None);
+        assert_eq!(mouse.handle(R, false, true), None);
+        assert_eq!(mouse.handle(L, true, false), None);
+        assert!(!mouse.left_down);
+        // Left pressed inside, released outside the image: no stuck button.
+        assert_eq!(mouse.handle(L, true, true), None);
+        assert_eq!(mouse.handle(L, false, false), None);
+        assert!(!mouse.left_down);
+        assert_eq!(mouse.handle(R, true, true), None);
+        assert_eq!(mouse.handle(R, false, false), Some(ViewerNav::Next));
+        // A button released while the viewer was not looking is dropped by `sync`.
+        assert_eq!(mouse.handle(L, true, true), None);
+        mouse.sync(false, false);
+        assert_eq!(mouse.handle(R, true, true), None);
+        assert_eq!(mouse.handle(R, false, true), Some(ViewerNav::Next));
+    }
+
+    #[test]
+    fn ctrl_wheel_resizes_the_grid_within_the_slider_range() {
+        let start = GRID_DEFAULT_CELL;
+        // Up enlarges, down shrinks, no movement changes nothing.
+        assert!(ctrl_wheel_cell_size(start, 50.0) > start);
+        assert!(ctrl_wheel_cell_size(start, -50.0) < start);
+        assert_eq!(ctrl_wheel_cell_size(start, 0.0), start);
+        assert_eq!(ctrl_wheel_cell_size(start, f32::NAN), start);
+        // A notch is a visible step (several points) but not a jump.
+        let step = ctrl_wheel_cell_size(start, 50.0) - start;
+        assert!((8.0..40.0).contains(&step), "{step}");
+        // Always inside the range of the size slider.
+        assert_eq!(ctrl_wheel_cell_size(GRID_MAX_CELL, 500.0), GRID_MAX_CELL);
+        assert_eq!(ctrl_wheel_cell_size(GRID_MIN_CELL, -500.0), GRID_MIN_CELL);
+        // Reaches both ends with enough notches, and a notch back undoes a notch forward.
+        let mut size = start;
+        for _ in 0..40 {
+            size = ctrl_wheel_cell_size(size, 50.0);
+        }
+        assert_eq!(size, GRID_MAX_CELL);
+        let there = ctrl_wheel_cell_size(start, 50.0);
+        assert!((ctrl_wheel_cell_size(there, -50.0) - start).abs() < 0.01);
     }
 
     #[test]
