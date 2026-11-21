@@ -368,6 +368,9 @@ fn default_grid_cell_size() -> f32 {
 fn default_show_filenames() -> bool {
     true
 }
+fn default_sort_by_datetime() -> bool {
+    false
+}
 
 fn loading_indicator(ui: &mut egui::Ui, rect: egui::Rect, label: &str) {
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
@@ -412,6 +415,8 @@ struct Settings {
     show_datetime: bool,
     #[serde(default = "default_show_filenames")]
     show_filenames: bool,
+    #[serde(default = "default_sort_by_datetime")]
+    sort_by_datetime: bool,
     #[serde(default = "default_grid_cell_size")]
     grid_cell_size: f32,
 }
@@ -578,6 +583,7 @@ impl Default for SorterApp {
                 show_exif: false,
                 show_datetime: true,
                 show_filenames: true,
+                sort_by_datetime: false,
                 grid_cell_size: GRID_DEFAULT_CELL,
             });
         let (scan_sender, scan_receiver) = mpsc::channel();
@@ -1350,6 +1356,25 @@ fn read_datetime(path: &Path) -> Option<String> {
     } else {
         exif_datetime(&read_exif(path))
     }
+}
+
+/// Grid ordering key: subfolder first, then capture date (when `by_date`), then file name.
+fn photo_order(left: &Photo, right: &Photo, by_date: bool) -> std::cmp::Ordering {
+    left.subfolder
+        .cmp(&right.subfolder)
+        .then_with(|| {
+            if by_date {
+                match (left.datetime.as_deref(), right.datetime.as_deref()) {
+                    (Some(left), Some(right)) => left.cmp(right),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .then_with(|| left.display.file_name().cmp(&right.display.file_name()))
 }
 
 fn photo_date(photo: &Photo) -> Option<&str> {
@@ -2694,6 +2719,37 @@ impl SorterApp {
         self.photos_version = self.photos_version.wrapping_add(1);
     }
 
+    /// Orders the photos by subfolder and, when `settings.sort_by_datetime` is on, by capture
+    /// date inside each subfolder (undated photos last, in filename order). Indices are resolved
+    /// by path afterwards so the current photo, the grid anchor and the selection stay on the
+    /// same files.
+    fn resort_photos(&mut self) {
+        let by_date = self.settings.sort_by_datetime;
+        let current = self.photos.get(self.current).map(|photo| photo.display.clone());
+        let anchor = self
+            .anchor
+            .and_then(|index| self.photos.get(index))
+            .map(|photo| photo.display.clone());
+        let selected: Vec<PathBuf> = self
+            .selection
+            .iter()
+            .filter_map(|index| self.photos.get(*index))
+            .map(|photo| photo.display.clone())
+            .collect();
+        self.photos
+            .sort_by(|left, right| photo_order(left, right, by_date));
+        self.photos_changed();
+        self.ensure_photo_index();
+        self.current = current
+            .and_then(|display| self.photo_index.get(&display).copied())
+            .unwrap_or_else(|| self.current.min(self.photos.len().saturating_sub(1)));
+        self.anchor = anchor.and_then(|display| self.photo_index.get(&display).copied());
+        self.selection = selected
+            .iter()
+            .filter_map(|display| self.photo_index.get(display).copied())
+            .collect();
+    }
+
     fn ensure_photo_index(&mut self) {
         if self.photo_index_version == self.photos_version && self.photo_index.len() == self.photos.len() {
             return;
@@ -2864,6 +2920,9 @@ impl SorterApp {
         }
         if dates_changed {
             self.dates_version = self.dates_version.wrapping_add(1);
+            if self.settings.sort_by_datetime {
+                self.resort_photos();
+            }
         }
     }
 
@@ -3340,12 +3399,7 @@ impl SorterApp {
                         if result.kind == ActionKind::Delete && !result.restored_photos.is_empty() {
                             let restored = result.restored_photos;
                             self.photos.extend(restored.clone());
-                            self.photos_changed();
-                            self.photos.sort_by(|left, right| {
-                                left.subfolder.cmp(&right.subfolder).then_with(|| {
-                                    left.display.file_name().cmp(&right.display.file_name())
-                                })
-                            });
+                            self.resort_photos();
                             self.selection.clear();
                             self.anchor = None;
                             if let Some(index) = self
@@ -4149,6 +4203,14 @@ impl eframe::App for SorterApp {
                 {
                     self.save_settings();
                 }
+                if ui
+                    .checkbox(&mut self.settings.sort_by_datetime, "Sort by date")
+                    .on_hover_text("Order each folder's images by capture date in the grid")
+                    .changed()
+                {
+                    self.save_settings();
+                    self.resort_photos();
+                }
                 if ui.checkbox(&mut self.settings.show_exif, "EXIF").changed() {
                     self.save_settings();
                 }
@@ -4198,7 +4260,11 @@ impl eframe::App for SorterApp {
                     if ui.button("Delete selected").clicked() {
                         self.sort_photos(ActionKind::Delete, ctx);
                     }
-                    ui.label(format!("{} selected", self.selection.len()));
+                    ui.label(format!(
+                        "{} selected/{} total",
+                        self.selection.len(),
+                        self.photos.len()
+                    ));
                     ui.label(status_text(&self.notice));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(6.0);
@@ -4951,6 +5017,30 @@ mod tests {
             datetime_loaded: false,
             kept: false,
         }
+    }
+
+    #[test]
+    fn photo_order_sorts_by_date_inside_a_folder_and_puts_undated_last() {
+        let mut early = test_photo("b.jpg");
+        early.datetime = Some("2019:01:02 10:00:00".into());
+        let mut late = test_photo("a.jpg");
+        late.datetime = Some("2021:05:06 08:00:00".into());
+        let undated = test_photo("c.jpg");
+        let mut other = test_photo("z.jpg");
+        other.subfolder = PathBuf::from("trip");
+
+        let names = |photos: &[Photo]| -> Vec<String> {
+            photos
+                .iter()
+                .map(|photo| photo.display.display().to_string())
+                .collect()
+        };
+        let mut photos = vec![late.clone(), undated.clone(), other.clone(), early.clone()];
+        photos.sort_by(|left, right| photo_order(left, right, true));
+        assert_eq!(names(&photos), ["b.jpg", "a.jpg", "c.jpg", "z.jpg"]);
+        let mut photos = vec![late, undated, other, early];
+        photos.sort_by(|left, right| photo_order(left, right, false));
+        assert_eq!(names(&photos), ["a.jpg", "b.jpg", "c.jpg", "z.jpg"]);
     }
 
     #[test]
