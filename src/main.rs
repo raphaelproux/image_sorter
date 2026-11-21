@@ -702,8 +702,10 @@ fn load_full(path: &Path) -> Option<Arc<Vec<u8>>> {
     Some(value.data)
 }
 
-fn is_rw2(path: &Path) -> bool {
-    extension(path) == "rw2"
+/// RAW formats whose embedded full-size JPEG preview is read directly by byte range
+/// (Panasonic RW2, Fujifilm RAF).
+fn has_embedded_preview(path: &Path) -> bool {
+    matches!(extension(path).as_str(), "rw2" | "raf")
 }
 
 fn is_raw(path: &Path) -> bool {
@@ -826,12 +828,38 @@ fn rw2_locate(head: &[u8]) -> Option<(usize, usize, u32)> {
     Some((offset, length, orientation))
 }
 
-/// Embedded JPEG preview of an RW2 and its orientation. Only the needed byte range is read,
-/// not the whole (about 20 MB) raw file.
-fn rw2_embedded_jpeg(path: &Path) -> Option<(Vec<u8>, u32)> {
+fn is_raf_data(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"FUJIFILMCCD-RAW")
+}
+
+/// Location (offset, length) of the embedded JPEG preview of a Fujifilm RAF. The header is
+/// big-endian: JPEG offset at byte 84, JPEG length at byte 88. The JPEG carries its own EXIF.
+fn raf_locate(head: &[u8]) -> Option<(usize, usize)> {
+    if !is_raf_data(head) {
+        return None;
+    }
+    let u32_at = |offset: usize| {
+        head.get(offset..offset + 4)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    };
+    let (offset, length) = (u32_at(84)?, u32_at(88)?);
+    (offset >= 92 && length >= 4).then_some((offset, length))
+}
+
+/// Embedded JPEG preview of an RW2 or RAF and its orientation. Only the needed byte range is
+/// read, not the whole (20-50 MB) raw file.
+fn embedded_jpeg(path: &Path) -> Option<(Vec<u8>, u32)> {
     const MAX_PREVIEW_BYTES: usize = 64 * 1024 * 1024;
     let prefix = load_prefix(path)?;
-    let (offset, length, orientation) = rw2_locate(&prefix.data)?;
+    let (offset, length, orientation) = match rw2_locate(&prefix.data) {
+        Some(located) => located,
+        None => {
+            let (offset, length) = raf_locate(&prefix.data)?;
+            // The orientation lives in the EXIF at the start of the embedded JPEG.
+            let orientation = orientation_of(parse_exif(&prefix.data).as_ref());
+            (offset, length, orientation)
+        }
+    };
     if length < 4 || length > MAX_PREVIEW_BYTES {
         return None;
     }
@@ -854,6 +882,12 @@ fn parse_exif(bytes: &[u8]) -> Option<exif::Exif> {
         let mut tiff = bytes.to_vec();
         tiff[2] = 0x2a;
         return exif::Reader::new().read_raw(tiff).ok();
+    }
+    if is_raf_data(bytes) {
+        let (offset, _) = raf_locate(bytes)?;
+        return exif::Reader::new()
+            .read_from_container(&mut std::io::Cursor::new(bytes.get(offset..)?))
+            .ok();
     }
     exif::Reader::new()
         .read_from_container(&mut std::io::Cursor::new(bytes))
@@ -1456,8 +1490,8 @@ fn viewer_decode_size(path: &Path) -> Option<(u32, u32)> {
         if let Some(size) = raw_dimensions(path) {
             return Some(size);
         }
-        if is_rw2(path) {
-            let (jpeg, orientation) = rw2_embedded_jpeg(path)?;
+        if has_embedded_preview(path) {
+            let (jpeg, orientation) = embedded_jpeg(path)?;
             return Some(oriented_dimensions(jpeg_dimensions(&jpeg)?, orientation));
         }
         return None;
@@ -1962,7 +1996,7 @@ fn color_image(decoded: image::DynamicImage) -> Option<ColorImage> {
 }
 
 fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
-    if is_raw(path) && !is_rw2(path) {
+    if is_raw(path) && !has_embedded_preview(path) {
         // Other RAW formats have no embedded-preview reader here: reuse the system thumbnail
         // for grid cells when there is one, otherwise develop the RAW at the requested size.
         if is_thumb(size) {
@@ -1972,8 +2006,8 @@ fn decode_preview(path: &Path, size: (u32, u32)) -> Option<ColorImage> {
         }
         return decode_raw(path, size);
     }
-    if is_rw2(path) {
-        let embedded = rw2_embedded_jpeg(path);
+    if has_embedded_preview(path) {
+        let embedded = embedded_jpeg(path);
         if !is_thumb(size) {
             let preview_size = embedded.as_ref().and_then(|(jpeg, orientation)| {
                 jpeg_dimensions(jpeg).map(|dimensions| oriented_dimensions(dimensions, *orientation))
@@ -4872,6 +4906,30 @@ mod tests {
         assert_eq!(viewer_decode_size(&path), Some((32, 64)));
         let full = decode_preview(&path, (1920, 1440)).expect("RW2 full preview");
         assert_eq!(full.size, [32, 64]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raf_uses_embedded_preview_and_exif() {
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 32, image::Rgb([20, 30, 200])))
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut file = vec![0u8; 148];
+        file[..16].copy_from_slice(b"FUJIFILMCCD-RAW ");
+        file[84..88].copy_from_slice(&148u32.to_be_bytes());
+        file[88..92].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        file.extend_from_slice(&jpeg);
+        file.resize(file.len() + 400 * 1024, 7);
+        assert_eq!(raf_locate(&file), Some((148, jpeg.len())));
+        assert_eq!(raf_locate(b"II*\x00"), None);
+        let root = std::env::temp_dir().join(format!("image_sorter_raf_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("DSCF0001.RAF");
+        fs::write(&path, &file).unwrap();
+        let thumbnail = decode_preview(&path, VIEW_PREVIEW).expect("RAF thumbnail");
+        assert_eq!(thumbnail.size, [64, 32]);
         fs::remove_dir_all(root).unwrap();
     }
 
