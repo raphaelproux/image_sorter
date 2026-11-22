@@ -558,6 +558,7 @@ struct SorterApp {
     /// it finishes (only used if the user has not moved in the meantime).
     action_start: Option<PathBuf>,
     action_next: Option<PathBuf>,
+    action_candidates: Vec<PathBuf>,
     last_viewer_image: Option<PathBuf>,
     scroll_to_selection: bool,
     grid_columns: usize,
@@ -675,6 +676,7 @@ impl Default for SorterApp {
             operation_pending: false,
             action_start: None,
             action_next: None,
+            action_candidates: Vec::new(),
             last_viewer_image: None,
             scroll_to_selection: false,
             grid_columns: 1,
@@ -3348,19 +3350,14 @@ impl SorterApp {
             .photos
             .get(self.current)
             .map(|photo| photo.display.clone());
-        self.action_next = self
+        self.action_candidates = self
             .photos
             .iter()
-            .skip(self.current + 1)
+            .skip(self.current.saturating_add(1))
+            .chain(self.photos.iter().take(self.current).rev())
             .map(|photo| photo.display.clone())
-            .next()
-            .or_else(|| {
-                self.photos
-                    .iter()
-                    .take(self.current)
-                    .map(|photo| photo.display.clone())
-                    .next()
-            });
+            .collect();
+        self.action_next = self.action_candidates.first().cloned();
         self.notice = format!(
             "{} {} file(s)…",
             if kind == ActionKind::Keep {
@@ -3408,7 +3405,9 @@ impl SorterApp {
                                 .position(|photo| photo.display == restored[0].display)
                             {
                                 self.current = index;
-                                self.mode = ViewMode::Viewer;
+                                self.selection.insert(index);
+                                self.anchor = Some(index);
+                                self.scroll_to_selection = true;
                                 let display = self.photos[index].display.clone();
                                 self.texture(
                                     ctx,
@@ -3516,8 +3515,28 @@ impl SorterApp {
                         self.forget_missing_textures(&available);
                         let start = self.action_start.take();
                         let next = self.action_next.take();
+                        let candidates = std::mem::take(&mut self.action_candidates);
                         let moved_on = current_display != start;
-                        let target = if moved_on || (self.mode == ViewMode::Grid && result.kind == ActionKind::Keep) {
+                        let delete_target = if result.kind == ActionKind::Delete
+                            && self.mode == ViewMode::Grid
+                            && !moved_on
+                        {
+                            candidates
+                                .iter()
+                                .find_map(|display| self.photo_index.get(display).copied())
+                                .map(|index| {
+                                    self.selection.clear();
+                                    self.selection.insert(index);
+                                    self.anchor = Some(index);
+                                    self.scroll_to_selection = true;
+                                    index
+                                })
+                        } else {
+                            None
+                        };
+                        let target = if let Some(index) = delete_target {
+                            self.photos.get(index).map(|photo| photo.display.clone())
+                        } else if moved_on || result.kind == ActionKind::Keep {
                             current_display.clone()
                         } else {
                             next.clone()
@@ -3531,6 +3550,8 @@ impl SorterApp {
                         if self.photos.is_empty() {
                             self.mode = ViewMode::Grid;
                             self.current = 0;
+                            self.selection.clear();
+                            self.anchor = None;
                         }
                     }
                     if result.kind == ActionKind::Keep || result.kind == ActionKind::Delete {
@@ -3555,6 +3576,7 @@ impl SorterApp {
         self.operation_pending = true;
         self.action_start = None;
         self.action_next = None;
+        self.action_candidates.clear();
         self.notice = "Undoing last operation…".into();
         let sender = self.operation_sender.clone();
         let repaint = ctx.clone();
@@ -3742,6 +3764,10 @@ impl SorterApp {
             "down" => key == Key::ArrowDown,
             _ => value.eq_ignore_ascii_case(&format!("{key:?}")),
         }
+    }
+
+    fn delete_shortcut_matches(value: &str, key: Key) -> bool {
+        key == Key::Delete || Self::shortcut_matches(value, key)
     }
 }
 
@@ -4326,7 +4352,7 @@ impl eframe::App for SorterApp {
                 .any(|key| Self::shortcut_matches(&self.settings.leave_shortcut, *key));
             let delete_pressed = pressed
                 .iter()
-                .any(|key| Self::shortcut_matches(&self.settings.delete_shortcut, *key));
+                .any(|key| Self::delete_shortcut_matches(&self.settings.delete_shortcut, *key));
             let open_pressed = pressed
                 .iter()
                 .any(|key| matches!(key, Key::Enter | Key::Space));
@@ -4920,6 +4946,9 @@ mod tests {
         assert!(SorterApp::shortcut_matches("Backspace", Key::Backspace));
         assert!(SorterApp::shortcut_matches("up", Key::ArrowUp));
         assert!(!SorterApp::shortcut_matches("F2", Key::F1));
+        assert!(SorterApp::delete_shortcut_matches("Backspace", Key::Delete));
+        assert!(SorterApp::delete_shortcut_matches("Backspace", Key::Backspace));
+        assert!(!SorterApp::delete_shortcut_matches("F2", Key::F1));
     }
 
     #[test]
@@ -5020,6 +5049,45 @@ mod tests {
     }
 
     #[test]
+    fn undo_delete_preserves_view_and_selects_restored_photo() {
+        let ctx = egui::Context::default();
+        for mode in [ViewMode::Grid, ViewMode::Viewer] {
+            let mut app = SorterApp::default();
+            app.photos = vec![test_photo("b.jpg"), test_photo("c.jpg")];
+            app.mode = mode;
+            app.current = 1;
+            app.operation_pending = true;
+            let restored = test_photo("a.jpg");
+            app.operation_sender
+                .send(OperationMessage::Complete(OperationResult {
+                    kind: ActionKind::Delete,
+                    history: HistoryEntry {
+                        kind: ActionKind::Delete,
+                        files: Vec::new(),
+                        photos: vec![restored.clone()],
+                        kept_before: HashMap::new(),
+                        kept_after: HashMap::new(),
+                        stash_directory: None,
+                    },
+                    completed: HashSet::new(),
+                    photo_files: Vec::new(),
+                    errors: Vec::new(),
+                    is_undo: true,
+                    restored_photos: vec![restored],
+                }))
+                .unwrap();
+
+            app.poll_operations(&ctx);
+
+            assert_eq!(app.mode, mode);
+            assert_eq!(app.photos[app.current].display, PathBuf::from("a.jpg"));
+            assert_eq!(app.selection, HashSet::from([app.current]));
+            assert_eq!(app.anchor, Some(app.current));
+            assert!(app.scroll_to_selection);
+        }
+    }
+
+    #[test]
     fn photo_order_sorts_by_date_inside_a_folder_and_puts_undated_last() {
         let mut early = test_photo("b.jpg");
         early.datetime = Some("2019:01:02 10:00:00".into());
@@ -5041,6 +5109,38 @@ mod tests {
         let mut photos = vec![late, undated, other, early];
         photos.sort_by(|left, right| photo_order(left, right, false));
         assert_eq!(names(&photos), ["a.jpg", "b.jpg", "c.jpg", "z.jpg"]);
+    }
+
+    #[test]
+    fn grid_delete_selects_next_or_nearest_previous_photo() {
+        let ctx = egui::Context::default();
+        for (current, deleted, candidates, expected) in [
+            (1, vec![1], vec!["c.jpg", "a.jpg"], "c.jpg"),
+            (2, vec![2], vec!["b.jpg", "a.jpg"], "b.jpg"),
+            (2, vec![1, 2], vec!["b.jpg", "a.jpg"], "a.jpg"),
+        ] {
+            let mut app = SorterApp::default();
+            app.photos = ["a.jpg", "b.jpg", "c.jpg"]
+                .iter()
+                .map(|name| test_photo(name))
+                .collect();
+            app.mode = ViewMode::Grid;
+            app.current = current;
+            app.selection = deleted.iter().copied().collect();
+            app.anchor = Some(current);
+            app.operation_pending = true;
+            app.action_start = Some(app.photos[current].display.clone());
+            app.action_candidates = candidates.iter().map(PathBuf::from).collect();
+            let message = finished_operation(ActionKind::Delete, &app.photos, &deleted);
+            app.operation_sender.send(message).unwrap();
+
+            app.poll_operations(&ctx);
+
+            assert_eq!(app.photos[app.current].display, PathBuf::from(expected));
+            assert_eq!(app.selection, HashSet::from([app.current]));
+            assert_eq!(app.anchor, Some(app.current));
+            assert!(app.scroll_to_selection);
+        }
     }
 
     #[test]
@@ -5076,6 +5176,17 @@ mod tests {
         app.operation_sender.send(message).unwrap();
         app.poll_operations(&ctx);
         assert_eq!(app.photos[app.current].display, PathBuf::from("b.jpg"));
+
+        // Keep in the viewer stays on the same photo.
+        let mut app = setup(0);
+        app.operation_pending = true;
+        app.action_start = Some(PathBuf::from("a.jpg"));
+        app.action_next = Some(PathBuf::from("b.jpg"));
+        let message = finished_operation(ActionKind::Keep, &app.photos, &[0]);
+        app.operation_sender.send(message).unwrap();
+        app.poll_operations(&ctx);
+        assert_eq!(app.mode, ViewMode::Viewer);
+        assert_eq!(app.photos[app.current].display, PathBuf::from("a.jpg"));
 
         // Keep: the user went back to the grid meanwhile and must stay there, on "d".
         let mut app = setup(0);
