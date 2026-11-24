@@ -371,6 +371,9 @@ fn default_show_filenames() -> bool {
 fn default_sort_by_datetime() -> bool {
     false
 }
+fn default_flatten_folder_structure() -> bool {
+    false
+}
 
 fn loading_indicator(ui: &mut egui::Ui, rect: egui::Rect, label: &str) {
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
@@ -417,6 +420,8 @@ struct Settings {
     show_filenames: bool,
     #[serde(default = "default_sort_by_datetime")]
     sort_by_datetime: bool,
+    #[serde(default = "default_flatten_folder_structure")]
+    flatten_folder_structure: bool,
     #[serde(default = "default_grid_cell_size")]
     grid_cell_size: f32,
 }
@@ -585,6 +590,7 @@ impl Default for SorterApp {
                 show_datetime: true,
                 show_filenames: true,
                 sort_by_datetime: false,
+                flatten_folder_structure: false,
                 grid_cell_size: GRID_DEFAULT_CELL,
             });
         let (scan_sender, scan_receiver) = mpsc::channel();
@@ -1360,10 +1366,19 @@ fn read_datetime(path: &Path) -> Option<String> {
     }
 }
 
-/// Grid ordering key: subfolder first, then capture date (when `by_date`), then file name.
-fn photo_order(left: &Photo, right: &Photo, by_date: bool) -> std::cmp::Ordering {
-    left.subfolder
-        .cmp(&right.subfolder)
+/// Grid ordering key: subfolder first unless flattened, then capture date (when `by_date`), then file name.
+fn photo_order(
+    left: &Photo,
+    right: &Photo,
+    by_date: bool,
+    flatten_folder_structure: bool,
+) -> std::cmp::Ordering {
+    let folder_order = if flatten_folder_structure {
+        std::cmp::Ordering::Equal
+    } else {
+        left.subfolder.cmp(&right.subfolder)
+    };
+    folder_order
         .then_with(|| {
             if by_date {
                 match (left.datetime.as_deref(), right.datetime.as_deref()) {
@@ -1377,6 +1392,19 @@ fn photo_order(left: &Photo, right: &Photo, by_date: bool) -> std::cmp::Ordering
             }
         })
         .then_with(|| left.display.file_name().cmp(&right.display.file_name()))
+        .then_with(|| left.display.cmp(&right.display))
+}
+
+fn zoom_pan_at_pointer(
+    center: egui::Pos2,
+    pan: Vec2,
+    pointer: egui::Pos2,
+    old_zoom: f32,
+    new_zoom: f32,
+) -> Vec2 {
+    let ratio = new_zoom / old_zoom;
+    let offset = pointer - center;
+    offset + (pan - offset) * ratio
 }
 
 fn photo_date(photo: &Photo) -> Option<&str> {
@@ -2721,12 +2749,13 @@ impl SorterApp {
         self.photos_version = self.photos_version.wrapping_add(1);
     }
 
-    /// Orders the photos by subfolder and, when `settings.sort_by_datetime` is on, by capture
-    /// date inside each subfolder (undated photos last, in filename order). Indices are resolved
+    /// Orders the photos by subfolder unless flattened, and by capture date when date sorting is
+    /// enabled. Indices are resolved
     /// by path afterwards so the current photo, the grid anchor and the selection stay on the
     /// same files.
     fn resort_photos(&mut self) {
         let by_date = self.settings.sort_by_datetime;
+        let flatten_folder_structure = self.settings.flatten_folder_structure;
         let current = self.photos.get(self.current).map(|photo| photo.display.clone());
         let anchor = self
             .anchor
@@ -2738,8 +2767,9 @@ impl SorterApp {
             .filter_map(|index| self.photos.get(*index))
             .map(|photo| photo.display.clone())
             .collect();
-        self.photos
-            .sort_by(|left, right| photo_order(left, right, by_date));
+        self.photos.sort_by(|left, right| {
+            photo_order(left, right, by_date, flatten_folder_structure)
+        });
         self.photos_changed();
         self.ensure_photo_index();
         self.current = current
@@ -2853,6 +2883,7 @@ impl SorterApp {
                 self.selection.clear();
                 self.anchor = None;
                 self.current = 0;
+                self.resort_photos();
                 self.dates_version = self.dates_version.wrapping_add(1);
                 self.start_datetime_scan(ctx);
             }
@@ -3659,6 +3690,9 @@ impl SorterApp {
 
     /// First and last (exclusive) photo index of the folder section containing `index`.
     fn folder_bounds(&self, index: usize) -> (usize, usize) {
+        if self.settings.flatten_folder_structure {
+            return (0, self.photos.len());
+        }
         let folder = &self.photos[index].subfolder;
         let mut start = index;
         while start > 0 && self.photos[start - 1].subfolder == *folder {
@@ -3864,7 +3898,15 @@ impl SorterApp {
                 layout
             }
             old => {
-                let groups = group_ranges(&self.photos, |photo| &photo.subfolder);
+                let groups = if self.settings.flatten_folder_structure {
+                    if self.photos.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![(0, self.photos.len())]
+                    }
+                } else {
+                    group_ranges(&self.photos, |photo| &photo.subfolder)
+                };
                 let layout = GridLayout::build(
                     &groups,
                     self.photos.len(),
@@ -3950,7 +3992,9 @@ impl SorterApp {
                     let top = origin.y + item.top;
                     if item.kind == GridItemKind::Header {
                         let folder = &self.photos[item.start].subfolder;
-                        let title = if folder.as_os_str().is_empty() {
+                        let title = if self.settings.flatten_folder_structure {
+                            "All photos".to_string()
+                        } else if folder.as_os_str().is_empty() {
                             root_name.clone()
                         } else {
                             folder.display().to_string()
@@ -4231,11 +4275,23 @@ impl eframe::App for SorterApp {
                 }
                 if ui
                     .checkbox(&mut self.settings.sort_by_datetime, "Sort by date")
-                    .on_hover_text("Order each folder's images by capture date in the grid")
+                    .on_hover_text("Order images by capture date in the grid")
                     .changed()
                 {
                     self.save_settings();
                     self.resort_photos();
+                }
+                if ui
+                    .checkbox(
+                        &mut self.settings.flatten_folder_structure,
+                        "Flatten folder structure",
+                    )
+                    .on_hover_text("Merge images from all subfolders into one grid section")
+                    .changed()
+                {
+                    self.save_settings();
+                    self.resort_photos();
+                    self.grid_layout = None;
                 }
                 if ui.checkbox(&mut self.settings.show_exif, "EXIF").changed() {
                     self.save_settings();
@@ -4604,7 +4660,20 @@ impl eframe::App for SorterApp {
                     0.0
                 };
                 if scroll != 0.0 {
-                    self.zoom = (self.zoom * (scroll / 300.0).exp()).clamp(0.1, 8.0);
+                    if let Some(pointer) = ctx
+                        .input(|input| input.pointer.hover_pos())
+                        .filter(|pointer| rect.contains(*pointer))
+                    {
+                        let old_zoom = self.zoom;
+                        self.zoom = (old_zoom * (scroll / 300.0).exp()).clamp(0.1, 8.0);
+                        self.pan = zoom_pan_at_pointer(
+                            rect.center(),
+                            self.pan,
+                            pointer,
+                            old_zoom,
+                            self.zoom,
+                        );
+                    }
                 }
                 let source_size = self.source_size(ctx, &photo.display);
                 let viewport = (
@@ -4877,6 +4946,7 @@ mod tests {
             kept: false,
         };
         // 4 columns: folder a has 6 photos (rows 4 + 2), folder b has 5 (rows 4 + 1).
+        app.settings.flatten_folder_structure = false;
         app.photos = (0..6)
             .map(|i| photo("a", &format!("{i}.jpg")))
             .chain((0..5).map(|i| photo("b", &format!("{i}.jpg"))))
@@ -5088,7 +5158,7 @@ mod tests {
     }
 
     #[test]
-    fn photo_order_sorts_by_date_inside_a_folder_and_puts_undated_last() {
+    fn photo_order_sorts_by_date_globally_when_flattened() {
         let mut early = test_photo("b.jpg");
         early.datetime = Some("2019:01:02 10:00:00".into());
         let mut late = test_photo("a.jpg");
@@ -5096,6 +5166,7 @@ mod tests {
         let undated = test_photo("c.jpg");
         let mut other = test_photo("z.jpg");
         other.subfolder = PathBuf::from("trip");
+        other.datetime = Some("2018:01:02 10:00:00".into());
 
         let names = |photos: &[Photo]| -> Vec<String> {
             photos
@@ -5104,11 +5175,17 @@ mod tests {
                 .collect()
         };
         let mut photos = vec![late.clone(), undated.clone(), other.clone(), early.clone()];
-        photos.sort_by(|left, right| photo_order(left, right, true));
+        photos.sort_by(|left, right| photo_order(left, right, true, false));
         assert_eq!(names(&photos), ["b.jpg", "a.jpg", "c.jpg", "z.jpg"]);
-        let mut photos = vec![late, undated, other, early];
-        photos.sort_by(|left, right| photo_order(left, right, false));
+        let mut photos = vec![late.clone(), undated.clone(), other.clone(), early.clone()];
+        photos.sort_by(|left, right| photo_order(left, right, true, true));
+        assert_eq!(names(&photos), ["z.jpg", "b.jpg", "a.jpg", "c.jpg"]);
+        let mut photos = vec![late, undated, other.clone(), early];
+        photos.sort_by(|left, right| photo_order(left, right, false, false));
         assert_eq!(names(&photos), ["a.jpg", "b.jpg", "c.jpg", "z.jpg"]);
+        let mut photos = vec![test_photo("b.jpg"), other, test_photo("a.jpg")];
+        photos.sort_by(|left, right| photo_order(left, right, false, true));
+        assert_eq!(names(&photos), ["a.jpg", "b.jpg", "z.jpg"]);
     }
 
     #[test]
@@ -5622,6 +5699,25 @@ mod tests {
         let restored = history.photos.clone();
         assert_eq!(restored[0].display, raw.display);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn viewer_wheel_zoom_keeps_the_pointer_anchor_stationary() {
+        let center = egui::pos2(400.0, 300.0);
+        let pointer = egui::pos2(520.0, 210.0);
+        let initial_pan = egui::vec2(-35.0, 18.0);
+        let old_zoom = 1.4;
+        let new_zoom = 2.3;
+        let before = (pointer - center - initial_pan) / old_zoom;
+        let zoomed_pan = zoom_pan_at_pointer(center, initial_pan, pointer, old_zoom, new_zoom);
+        let after = (pointer - center - zoomed_pan) / new_zoom;
+        assert!((before - after).length() < 0.001);
+
+        let restored_pan = zoom_pan_at_pointer(center, zoomed_pan, pointer, new_zoom, old_zoom);
+        assert!((restored_pan - initial_pan).length() < 0.001);
+
+        let centered_pan = zoom_pan_at_pointer(center, initial_pan, center, old_zoom, new_zoom);
+        assert!((centered_pan - initial_pan * (new_zoom / old_zoom)).length() < 0.001);
     }
 
     #[test]

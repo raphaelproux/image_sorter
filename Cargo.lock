@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "image_sorter"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "eframe",
  "flate2",
